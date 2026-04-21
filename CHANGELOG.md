@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-04-21
+
+### 🎉 First Production Release on Google Play Store!
+
+VSCodroid is now publicly available on Google Play. This release represents the cumulative work across milestones M0–M6, bringing a full VS Code IDE experience to Android.
+
 ### Added
 - CI/CD pipeline: test job in CI, tag-triggered release workflow, GitHub Pages deployment
 - Privacy policy hosted on GitHub Pages
@@ -14,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Third-party attribution file (NOTICE.md)
 - User guide documentation
 - Full changelog with milestone history
+
+### Fixed
+- Edge-to-edge display: upgrade AGP 8.9.1 + Activity 1.12.4 + Core 1.16.0 for proper edge-to-edge support
+- Material library updated to 1.14.0-alpha09 to resolve edge-to-edge warnings
+- Remove deprecated edge-to-edge theme attributes and fitsSystemWindows from layouts
+
+### Changed
+- Google Play production access granted — app now publicly available
 
 ## [0.1.0-m0] - 2026-02-10
 
@@ -85,5 +99,6 @@ This release represents the cumulative work across milestones M0 through M5, bri
 - Health check polling for server readiness
 - Android intent handling for "Open with VSCodroid"
 
-[Unreleased]: https://github.com/rmyndharis/VSCodroid/compare/v0.1.0-m0...HEAD
+[Unreleased]: https://github.com/rmyndharis/VSCodroid/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/rmyndharis/VSCodroid/compare/v0.1.0-m0...v1.0.0
 [0.1.0-m0]: https://github.com/rmyndharis/VSCodroid/releases/tag/v0.1.0-m0

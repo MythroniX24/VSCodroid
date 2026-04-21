@@ -33,20 +33,20 @@
 </p>
 
 ---
+<p align="center">
+  <a href="https://play.google.com/store/apps/details?id=com.vscodroid">
+    <img src="https://play.google.com/intl/en_us/badges/static/images/badges/en_badge_web_generic.png" alt="Get it on Google Play" width="250">
+  </a>
+</p>
 
-> [!IMPORTANT]
+> [!TIP]
 >
-> ### 🧪 Closed Testing — Now Live on Google Play!
+> ### 🚀 Now Available on Google Play!
 >
-> VSCodroid is now available as a **Closed Test** on Google Play:
+> VSCodroid is publicly available on Google Play. Download it now and start coding on your Android device.
 >
-> 🔗 **[play.google.com/apps/testing/com.vscodroid](https://play.google.com/apps/testing/com.vscodroid)**
->
-> Since this is a closed test, your Google account email must be registered as a tester before you can access the download.
->
-> **Want to join?** Send an email to **[yudhi@rmyndharis.com](mailto:yudhi@rmyndharis.com)** with the Google account email address you'd like registered as a tester.
+> 🔗 **[Get VSCodroid on Google Play](https://play.google.com/store/apps/details?id=com.vscodroid)**
 
----
 
 > _What if the next great developer is holding a phone, not a laptop?_
 > _What if a career in software could start without buying expensive hardware?_
@@ -182,13 +182,12 @@ flowchart TD
 
 ## 🚀 Getting Started
 
-### Install from Google Play (Closed Testing)
+### Install from Google Play
 
-1. **Request access** — Email [yudhi@rmyndharis.com](mailto:yudhi@rmyndharis.com) with your Google account email to be added as a tester.
-2. Once approved, install from [Google Play Closed Test](https://play.google.com/apps/testing/com.vscodroid).
-3. Open the app. Core binaries extract automatically (~5-10 seconds).
-4. Pick your languages (Go, Rust, Java, etc.). They install automatically.
-5. Start coding. Editor, terminal, and tools are ready.
+1. **Install** from [Google Play](https://play.google.com/store/apps/details?id=com.vscodroid).
+2. Open the app. Core binaries extract automatically (~5-10 seconds).
+3. Pick your languages (Go, Ruby, Java, etc.). They install automatically.
+4. Start coding. Editor, terminal, and tools are ready.
 
 > You can also download APKs directly from [GitHub Releases](https://github.com/rmyndharis/VSCodroid/releases).
 

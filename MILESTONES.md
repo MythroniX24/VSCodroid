@@ -528,13 +528,13 @@ _Order: audit code → configure release build → test on devices → validate 
     - [x] Category: Developer Tools
     - [x] Content rating questionnaire
     - [x] Foreground service permission declaration (video demo + written justification)
-    - [ ] Prepare for binary execution policy review (explain .so trick, local-only execution)
+    - [x] Prepare for binary execution policy review (explain .so trick, local-only execution) — passed; production access granted
 
 13. **Launch**
     - [x] Internal testing track — AAB uploaded (versionCode 2)
     - [x] Closed testing track — AAB v0.2.2-m6 (versionCode 4) uploaded, 12 testers added, 14-day countdown started
-    - [ ] Open beta (after 14-day closed testing period)
-    - [ ] Production release
+    - [x] Open beta — skipped; production access granted directly
+    - [x] Production release — v1.0.0 (versionCode 10) published to production track
     - [ ] Monitor crash reports (CrashReporter) and user feedback
     - [ ] Post-launch: respond to Play Store reviews
 
@@ -551,10 +551,10 @@ _Order: audit code → configure release build → test on devices → validate 
 - [x] Play Store listing complete (title, description, screenshots, content rating, foreground service declaration)
 - [x] Closed testing track live — v0.2.2-m6 (versionCode 4), 12 testers, 14-day period started
 - [x] CI pipeline green (Build + Unit Tests + Release workflows all passing)
-- [ ] App published on Play Store (waiting: 14-day closed testing → open beta → production)
-- [ ] Passes Play Store review (no policy violations)
+- [x] App published on Play Store — v1.0.0 production release
+- [x] Passes Play Store review (no policy violations) — production access granted 2026-04-21
 - [ ] No critical bugs in first 48 hours
-- [ ] At least 500 beta testers before production launch (see Release Plan §1.2)
+- [ ] At least 500 active users (adjusted from beta target; production launched directly)
 
 ### Estimated Effort: 6-8 weeks
 
