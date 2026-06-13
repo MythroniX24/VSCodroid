@@ -22,7 +22,13 @@ import java.net.URL
 class VSCodroidWebViewClient(
     private val allowedPort: Int,
     private val onCrash: () -> Unit,
-    private val onPageLoaded: () -> Unit
+    private val onPageLoaded: () -> Unit,
+    /**
+     * Fired in [onPageStarted], before VS Code's JavaScript begins executing.
+     * Use this to inject matchMedia overrides and any early-boot patches that
+     * MUST be present before VS Code's workbench module system initialises.
+     */
+    private val onEarlyPageStart: (() -> Unit)? = null
 ) : WebViewClient() {
 
     private val tag = "WebViewClient"
@@ -60,6 +66,10 @@ class VSCodroidWebViewClient(
 
     override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
         Logger.d(tag, "Page loading: $url")
+        // Fire early-boot JS injection ASAP — before VS Code's workbench JS runs.
+        // evaluateJavascript is safe to call from onPageStarted; it queues behind
+        // the page's initial HTML parse but before any <script> execution completes.
+        onEarlyPageStart?.invoke()
     }
 
     override fun onPageFinished(view: WebView, url: String?) {
