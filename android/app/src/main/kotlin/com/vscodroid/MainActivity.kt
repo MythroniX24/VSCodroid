@@ -6,70 +6,126 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
-import android.os.Bundle
 import android.net.Uri
+import android.os.Bundle
 import android.os.IBinder
 import android.os.SystemClock
+import android.view.FrameLayout
+import android.webkit.ValueCallback
 import android.webkit.WebView
 import android.widget.Toast
-import java.io.File
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.enableEdgeToEdge
-import com.vscodroid.util.CrashReporter
-import com.vscodroid.util.StorageManager
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.lifecycleScope
-import com.vscodroid.util.Environment
 import com.vscodroid.bridge.AndroidBridge
 import com.vscodroid.bridge.ClipboardBridge
+import com.vscodroid.bridge.ExtensionBridge
 import com.vscodroid.bridge.SecurityManager
 import com.vscodroid.keyboard.ExtraKeyRow
 import com.vscodroid.keyboard.KeyInjector
 import com.vscodroid.service.NodeService
 import com.vscodroid.storage.SafStorageManager
+import com.vscodroid.util.CrashReporter
+import com.vscodroid.util.Environment
 import com.vscodroid.util.Logger
+import com.vscodroid.util.StorageManager
+import com.vscodroid.webview.DesktopModeJS
 import com.vscodroid.webview.VSCodroidWebChromeClient
 import com.vscodroid.webview.VSCodroidWebView
 import com.vscodroid.webview.VSCodroidWebViewClient
+import com.vscodroid.webview.VSCodroidWebViewComponent
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 
 class MainActivity : AppCompatActivity() {
+
     private val tag = "MainActivity"
 
-    private var webView: WebView? = null
+    // -- Views --
+    private var webView: VSCodroidWebViewComponent? = null
     private var extraKeyRow: ExtraKeyRow? = null
+
+    // -- Service --
     private var nodeService: NodeService? = null
     private var serviceBound = false
     private var serviceBindingInitiated = false
+
+    // -- State --
     private var serverPort = 0
     private var backgroundedAt = 0L
     private var bridgeInitialized = false
-
     private var pendingFileUri: Uri? = null
+
+    // -- Bridges --
     private lateinit var securityManager: SecurityManager
     private lateinit var safManager: SafStorageManager
+    private lateinit var extensionBridge: ExtensionBridge
+
+    // -- File chooser state --
+    /**
+     * Pending callback from [VSCodroidWebChromeClient.onShowFileChooser].
+     * Must be fulfilled (or null-cancelled) before another picker can open.
+     * Held here on the Activity so the ActivityResult launcher can access it.
+     */
+    private var pendingFileChooserCallback: ValueCallback<Array<Uri>>? = null
+
+    // =====================================================================
+    // Activity Result Launchers
+    // =====================================================================
 
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        Logger.i(tag, "Notification permission granted=$granted")
-    }
+    ) { granted -> Logger.i(tag, "Notification permission granted=$granted") }
 
     /**
-     * SAF folder picker launcher.
-     * When a user selects a folder, we persist the permission, sync to a local mirror,
-     * and reload VS Code with the mirror path.
+     * SAF folder picker — called from [AndroidBridge.openFolderPicker] via JS.
      */
     private val folderPickerLauncher = registerForActivityResult(
         ActivityResultContracts.OpenDocumentTree()
+    ) { uri -> uri?.let { handleSafFolderSelected(it) } }
+
+    /**
+     * Generic file picker for WebView [VSCodroidWebChromeClient.onShowFileChooser].
+     * Accepts any file type (VS Code's "Open File" dialog and similar).
+     */
+    private val filePickerLauncher = registerForActivityResult(
+        ActivityResultContracts.GetContent()
     ) { uri ->
-        uri?.let { handleSafFolderSelected(it) }
+        val cb = pendingFileChooserCallback
+        pendingFileChooserCallback = null
+        cb?.onReceiveValue(if (uri != null) arrayOf(uri) else null)
     }
+
+    /**
+     * VSIX-specific file picker — restricts selection to .vsix files.
+     * Called from the "Install Extension from VSIX" command in VS Code's palette.
+     */
+    private val vsixPickerLauncher = registerForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri ->
+        if (uri == null) return@registerForActivityResult
+        Logger.i(tag, "VSIX selected: $uri")
+        val token = securityManager.getSessionToken()
+        val result = extensionBridge.installVsixFromUri(uri.toString(), token)
+        Logger.i(tag, "VSIX install result: $result")
+        runOnUiThread {
+            Toast.makeText(this, "Extension installed. Reloading VS Code…", Toast.LENGTH_SHORT).show()
+            // Reload VS Code so the extension is activated
+            webView?.reload()
+        }
+    }
+
+    // =====================================================================
+    // Service connection
+    // =====================================================================
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -87,21 +143,22 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // =====================================================================
+    // Lifecycle
+    // =====================================================================
+
     override fun onCreate(savedInstanceState: Bundle?) {
-        // enableEdgeToEdge() must be called BEFORE super.onCreate().
-        // Handles status bar, navigation bar, and system bar styling automatically
-        // with backward compatibility across Android 13-16+.
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        // Apply system bar insets as padding directly on the WebView so VS Code's
-        // title bar (breadcrumbs, back/forward, search) renders below the status bar.
-        // CSS env(safe-area-inset-*) may not report correct values after enableEdgeToEdge(),
-        // so we handle it at the native level.
-        val wv = findViewById<android.view.View>(R.id.webView)
-        androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(wv) { v, insets ->
-            val bars = insets.getInsets(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+        // Apply system bar insets to the CONTAINER (FrameLayout), not the WebView.
+        // This keeps env(safe-area-inset-*) CSS values correct inside VS Code —
+        // if we padded the WebView directly, VS Code's own safe-area CSS would
+        // double-compensate and render content too far from the edges.
+        val container = findViewById<android.view.View>(R.id.webViewContainer)
+        ViewCompat.setOnApplyWindowInsetsListener(container) { v, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
             v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
             insets
         }
@@ -116,9 +173,6 @@ class MainActivity : AppCompatActivity() {
         checkPreviousCrash()
         checkStorageHealth()
 
-        // Capture file URI from launch intent for processing after VS Code loads.
-        // onNewIntent() handles intents when the activity is already running,
-        // but onCreate() intents are lost without this.
         val launchUri = intent?.data
         if (launchUri != null && launchUri.scheme != "vscodroid") {
             pendingFileUri = launchUri
@@ -128,28 +182,23 @@ class MainActivity : AppCompatActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         val uri = intent.data
-        if (uri?.scheme == "vscodroid" && uri.host == "callback") {
-            handleExtensionCallback(uri)
-            return
+        when {
+            uri?.scheme == "vscodroid" && uri.host == "callback" -> handleExtensionCallback(uri)
+            uri?.scheme == "vscodroid" && uri.host == "oauth"    -> handleOAuthCallback(uri)
+            else -> handleIntent(intent)
         }
-        if (uri?.scheme == "vscodroid" && uri.host == "oauth") {
-            handleOAuthCallback(uri)
-            return
-        }
-        handleIntent(intent)
     }
 
     override fun onDestroy() {
         safManager.stopFileWatcher()
         if (serviceBindingInitiated) {
-            try {
-                unbindService(serviceConnection)
-            } catch (_: IllegalArgumentException) {
-                // Already unbound — safe to ignore
-            }
+            try { unbindService(serviceConnection) } catch (_: IllegalArgumentException) {}
             serviceBindingInitiated = false
             serviceBound = false
         }
+        // Cancel any pending file chooser so the WebView isn't left waiting
+        pendingFileChooserCallback?.onReceiveValue(null)
+        pendingFileChooserCallback = null
         webView?.destroy()
         webView = null
         super.onDestroy()
@@ -157,9 +206,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStop() {
         super.onStop()
-        if (serverPort > 0) {
-            backgroundedAt = SystemClock.elapsedRealtime()
-        }
+        if (serverPort > 0) backgroundedAt = SystemClock.elapsedRealtime()
     }
 
     override fun onStart() {
@@ -173,40 +220,30 @@ class MainActivity : AppCompatActivity() {
         if (level >= TRIM_MEMORY_RUNNING_LOW) {
             Logger.w(tag, "Low memory signal: level=$level")
             writeMemoryPressure(level)
-            webView?.evaluateJavascript(
-                "window.__vscodroid?.onLowMemory?.($level)", null
-            )
+            webView?.evaluateJavascript("window.__vscodroid?.onLowMemory?.($level)", null)
         }
     }
 
-    // -- SAF Folder Picker --
+    // =====================================================================
+    // SAF Folder Picker
+    // =====================================================================
 
-    /**
-     * Opens the Android SAF folder picker UI.
-     * Called from [AndroidBridge.openFolderPicker] via JS bridge.
-     */
     fun openFolderPicker() {
         folderPickerLauncher.launch(null)
     }
 
-    /**
-     * Handles a SAF folder selection result:
-     * 1. Persists the URI permission
-     * 2. Syncs folder contents to a local mirror (with progress dialog)
-     * 3. Reloads VS Code with the mirror path
-     */
+    fun openVsixPicker() {
+        vsixPickerLauncher.launch("*/*")
+    }
+
     private fun handleSafFolderSelected(uri: Uri) {
         Logger.i(tag, "SAF folder selected: $uri")
-
-        // Persist permission so we can access this folder after app restart
         safManager.persistPermission(uri)
-
         val displayName = safManager.getDisplayName(uri)
 
-        // Show progress dialog during sync
         val dialog = AlertDialog.Builder(this)
             .setTitle("Opening folder")
-            .setMessage("Syncing \"$displayName\"...")
+            .setMessage("Syncing \"$displayName\"…")
             .setCancelable(false)
             .create()
         dialog.show()
@@ -216,161 +253,54 @@ class MainActivity : AppCompatActivity() {
                 val mirrorDir = withContext(Dispatchers.IO) {
                     safManager.syncToLocal(uri) { done, total ->
                         runOnUiThread {
-                            dialog.setMessage(
-                                "Syncing \"$displayName\"\n$done / $total files..."
-                            )
+                            dialog.setMessage("Syncing \"$displayName\"\n$done / $total files…")
                         }
                     }
                 }
-
-                // Stop any existing file watcher before starting a new one
                 safManager.stopFileWatcher()
                 safManager.startFileWatcher(mirrorDir, uri)
-
-                // Write active folder so new terminals cd to the right place
                 writeActiveFolder(mirrorDir.absolutePath)
-
                 dialog.dismiss()
-
-                // Reload VS Code with the mirror directory
-                if (serverPort > 0) {
-                    navigateToFolder(serverPort, mirrorDir.absolutePath)
-                }
+                if (serverPort > 0) navigateToFolder(serverPort, mirrorDir.absolutePath)
             } catch (e: SecurityException) {
                 dialog.dismiss()
-                Toast.makeText(
-                    this@MainActivity,
-                    "Permission denied. Please select the folder again.",
-                    Toast.LENGTH_LONG
-                ).show()
+                Toast.makeText(this@MainActivity,
+                    "Permission denied. Please select the folder again.", Toast.LENGTH_LONG).show()
                 Logger.e(tag, "SAF permission revoked during sync", e)
             } catch (e: Exception) {
                 dialog.dismiss()
-                Toast.makeText(
-                    this@MainActivity,
-                    "Failed to open folder: ${e.message}",
-                    Toast.LENGTH_LONG
-                ).show()
+                Toast.makeText(this@MainActivity,
+                    "Failed to open folder: ${e.message}", Toast.LENGTH_LONG).show()
                 Logger.e(tag, "SAF sync failed", e)
             }
         }
     }
 
-    /**
-     * Opens a previously selected SAF folder from the recent list.
-     * Called from [AndroidBridge.openRecentFolder] via JS bridge.
-     */
     fun openRecentSafFolder(uri: Uri) {
         if (!safManager.hasPersistedPermission(uri)) {
-            Toast.makeText(
-                this,
-                "Permission expired. Please select the folder again.",
-                Toast.LENGTH_LONG
-            ).show()
-            // Open the picker as a fallback
+            Toast.makeText(this, "Permission expired. Please select the folder again.", Toast.LENGTH_LONG).show()
             openFolderPicker()
             return
         }
         handleSafFolderSelected(uri)
     }
 
-    // -- Internal --
-
-    private fun writeMemoryPressure(level: Int) {
-        try {
-            val tmpDir = File(cacheDir, "tmp")
-            File(tmpDir, "vscodroid-memory-pressure").writeText(level.toString())
-        } catch (e: Exception) {
-            Logger.d(tag, "Failed to write memory pressure: ${e.message}")
-        }
-    }
-
-    /**
-     * After resuming from background, checks if the VS Code connection is still
-     * healthy. Android freezes WebView JS execution in the background, which can
-     * cause the WebSocket IPC channel to the server to time out. This leads to
-     * "Canceled" errors on gallery requests and IndexedDB connections closing.
-     *
-     * Strategy:
-     * - >5 min background: force reload (stale state almost certain)
-     * - >1 min background: run JS health check, reload only if broken
-     * - <1 min: no action needed (WebSocket survives short pauses)
-     */
-    private fun handleResumeFromBackground() {
-        val ts = backgroundedAt
-        if (ts == 0L || serverPort == 0) return
-        backgroundedAt = 0
-
-        // Don't interfere if server is restarting — onServerReady handles reload
-        if (nodeService?.isServerRunning() != true) return
-
-        val bgMs = SystemClock.elapsedRealtime() - ts
-        when {
-            bgMs > FORCE_RELOAD_THRESHOLD_MS -> {
-                Logger.i(tag, "Reloading after ${bgMs / 1000}s in background")
-                webView?.reload()
-            }
-            bgMs > HEALTH_CHECK_THRESHOLD_MS -> {
-                checkConnectionHealth(bgMs)
-            }
-        }
-    }
-
-    /**
-     * Evaluates a JS health check in the WebView that detects:
-     * 1. VS Code reconnection dialog (WebSocket IPC channel broken)
-     * 2. IndexedDB "closed" state (database connection lost during freeze)
-     *
-     * If either issue is detected, triggers window.location.reload() from JS
-     * to re-establish all connections cleanly.
-     */
-    private fun checkConnectionHealth(bgMs: Long) {
-        val wv = webView ?: return
-        wv.evaluateJavascript(
-            """
-            (function() {
-                var i, text;
-                var dialogs = document.querySelectorAll('.monaco-dialog-box');
-                for (i = 0; i < dialogs.length; i++) {
-                    text = (dialogs[i].textContent || '').toLowerCase();
-                    if (text.indexOf('reconnect') >= 0 || text.indexOf('lost') >= 0) {
-                        console.warn('[VSCodroid] Connection lost, reloading');
-                        window.location.reload();
-                        return 'reload:connection-lost';
-                    }
-                }
-                try {
-                    var req = indexedDB.open('vscode-web-db');
-                    req.onerror = function() {
-                        console.warn('[VSCodroid] IndexedDB broken, reloading');
-                        window.location.reload();
-                    };
-                    req.onsuccess = function() { req.result.close(); };
-                } catch(e) {
-                    console.warn('[VSCodroid] IndexedDB exception, reloading');
-                    window.location.reload();
-                    return 'reload:idb-exception';
-                }
-                return 'ok';
-            })()
-            """.trimIndent()
-        ) { result ->
-            Logger.i(tag, "Health check after ${bgMs / 1000}s: ${result?.trim('"')}")
-        }
-    }
+    // =====================================================================
+    // WebView setup
+    // =====================================================================
 
     private fun setupWebView() {
+        // The view inflated from activity_main.xml is already VSCodroidWebViewComponent
         webView = findViewById(R.id.webView)
         webView?.let { wv ->
             VSCodroidWebView.configure(wv)
-            // Show a loading placeholder while Node.js starts
-            // viewport-fit=cover enables rendering into display cutout area
             wv.loadData(
-                """<html><head><meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"></head>
-                   <body style="background:#1e1e1e;color:#888;font-family:sans-serif;
+                """<html><head>
+                   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+                   </head><body style="background:#1e1e1e;color:#888;font-family:sans-serif;
                    display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
                    <div style="text-align:center"><h2 style="color:#ccc;">VSCodroid</h2>
-                   <p>Starting server...</p></div></body></html>""",
+                   <p>Starting server…</p></div></body></html>""",
                 "text/html", "utf-8"
             )
         }
@@ -386,27 +316,25 @@ class MainActivity : AppCompatActivity() {
             override fun handleOnBackPressed() {
                 webView?.evaluateJavascript(
                     "(function() { return window.AndroidBridge?.onBackPressed?.() || false; })()"
-                ) { result ->
-                    if (result != "true") {
-                        moveTaskToBack(true)
-                    }
-                }
+                ) { result -> if (result != "true") moveTaskToBack(true) }
             }
         })
     }
 
+    // =====================================================================
+    // Service
+    // =====================================================================
+
     private fun requestNotificationPermission() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
             != PackageManager.PERMISSION_GRANTED
-        ) {
-            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-        }
+        ) notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
 
     private fun startAndBindService() {
-        val serviceIntent = Intent(this, NodeService::class.java)
-        startForegroundService(serviceIntent)
-        bindService(serviceIntent, serviceConnection, Context.BIND_AUTO_CREATE)
+        val intent = Intent(this, NodeService::class.java)
+        startForegroundService(intent)
+        bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
         serviceBindingInitiated = true
     }
 
@@ -421,12 +349,6 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, message, Toast.LENGTH_LONG).show()
             }
         }
-
-        // If the server is already running (activity recreated, rotation, etc.),
-        // the launchServer() coroutine has already completed and won't fire again.
-        // Check immediately and load the WebView if the server process is alive.
-        // Note: isServerRunning() checks process.isAlive (no I/O), whereas
-        // isServerHealthy() does HTTP — which throws NetworkOnMainThreadException.
         val service = nodeService ?: return
         val port = service.getPort()
         if (port > 0 && service.isServerRunning()) {
@@ -436,23 +358,44 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // =====================================================================
+    // VS Code loading
+    // =====================================================================
+
     private fun loadVSCode(port: Int, folderPath: String? = null) {
         initBridge(port)
         navigateToFolder(port, folderPath ?: Environment.getProjectsDir(this))
     }
 
     /**
-     * Initializes the WebView bridge, security manager, and clients.
-     * Only called once per server lifecycle — not on every folder switch.
+     * Initializes the WebView bridge infrastructure — called once per server lifecycle.
+     *
+     * Sets up in order:
+     * 1. [SecurityManager] (token generation)
+     * 2. [ExtensionBridge] (VSIX install, extension management)
+     * 3. [AndroidBridge] (core Android ↔ JS bridge)
+     * 4. [VSCodroidWebViewClient] with [onEarlyPageStart] for matchMedia override
+     * 5. [VSCodroidWebChromeClient] with file-chooser callback
+     * 6. [KeyInjector] for extra key row modifier forwarding
      */
     private fun initBridge(port: Int) {
         val wv = webView ?: return
-
-        // Skip re-initialization if bridge is already set up for this port
         if (bridgeInitialized) return
         bridgeInitialized = true
 
         securityManager = SecurityManager(port)
+
+        // Extension bridge — VSIX install, extension listing
+        extensionBridge = ExtensionBridge(
+            context = this,
+            security = securityManager,
+            onVsixInstalled = { extensionId ->
+                Logger.i(tag, "Extension installed via bridge: $extensionId")
+            }
+        )
+        wv.addJavascriptInterface(extensionBridge, "AndroidExtensionBridge")
+
+        // Core AndroidBridge
         val clipboardBridge = ClipboardBridge(this)
         val bridge = AndroidBridge(
             context = this,
@@ -462,30 +405,46 @@ class MainActivity : AppCompatActivity() {
             onMinimize = { moveTaskToBack(true) },
             onOpenFolderPicker = { openFolderPicker() },
             onOpenRecentFolder = { uri -> openRecentSafFolder(uri) },
+            onOpenVsixPicker = { openVsixPicker() },
             onShowAbout = { runOnUiThread { showAboutDialog() } },
             safManager = safManager
         )
         wv.addJavascriptInterface(bridge, "AndroidBridge")
 
-        // Register ServiceWorkerClient BEFORE loading VS Code — service worker
-        // script fetches bypass WebViewClient.shouldInterceptRequest entirely.
+        // ServiceWorker interception must be set up before loadUrl
         VSCodroidWebViewClient.setupServiceWorkerInterception(port)
 
         wv.webViewClient = VSCodroidWebViewClient(
             allowedPort = port,
             onCrash = { recreateWebView() },
-            onPageLoaded = { injectBridgeToken() }
+            onPageLoaded = { injectBridgeToken() },
+            // onEarlyPageStart: fires in WebViewClient.onPageStarted, BEFORE VS Code JS runs.
+            // This is the only reliable place to override matchMedia / navigator before
+            // VS Code's workbench module loader evaluates them at startup.
+            onEarlyPageStart = { injectEarlyBootPatches() }
         )
-        wv.webChromeClient = VSCodroidWebChromeClient()
+
+        // WebChromeClient with file chooser routing.
+        // The callback lambda captures pendingFileChooserCallback and opens the file picker.
+        wv.webChromeClient = VSCodroidWebChromeClient(
+            onFileChooserRequested = { callback ->
+                pendingFileChooserCallback?.onReceiveValue(null)  // cancel any stale callback
+                pendingFileChooserCallback = callback
+                filePickerLauncher.launch("*/*")
+            },
+            onWindowCreateRequested = { newWebView ->
+                // Extension webview panels open as new Window contexts.
+                // We configure them with the same settings and don't display them
+                // separately — VS Code's internal iframe routing handles the display.
+                VSCodroidWebView.configure(newWebView)
+                Logger.d(tag, "Extension webview window created")
+            }
+        )
 
         val keyInjector = KeyInjector(wv)
         extraKeyRow?.keyInjector = keyInjector
     }
 
-    /**
-     * Navigates the WebView to a specific folder without re-initializing the bridge.
-     * Safe to call multiple times (e.g., when switching SAF folders).
-     */
     private fun navigateToFolder(port: Int, folderPath: String) {
         val wv = webView ?: return
         val url = "http://127.0.0.1:$port/?folder=${Uri.encode(folderPath)}"
@@ -493,445 +452,246 @@ class MainActivity : AppCompatActivity() {
         wv.loadUrl(url)
     }
 
-    /**
-     * Writes the active folder path to ~/.vscodroid_folder so new terminals
-     * can cd to the correct directory. See bashrc in FirstRunSetup.
-     */
     private fun writeActiveFolder(folderPath: String) {
         try {
-            val homeDir = File(Environment.getHomeDir(this))
-            File(homeDir, ".vscodroid_folder").writeText(folderPath)
-            Logger.d(tag, "Active folder: $folderPath")
+            File(Environment.getHomeDir(this), ".vscodroid_folder").writeText(folderPath)
         } catch (e: Exception) {
             Logger.d(tag, "Failed to write active folder: ${e.message}")
         }
     }
 
+    // =====================================================================
+    // JavaScript injections — early boot (onPageStarted)
+    // =====================================================================
+
+    /**
+     * Injected at [onPageStarted], before VS Code's JavaScript executes.
+     *
+     * Order matters: matchMedia must be patched before VS Code's startup code
+     * runs [workbench.esm.html → workbench.js → isMobile detection].
+     */
+    private fun injectEarlyBootPatches() {
+        val wv = webView ?: return
+        // 1. matchMedia override — forces (pointer:fine), (hover:hover), dark scheme
+        wv.evaluateJavascript(DesktopModeJS.MATCH_MEDIA_OVERRIDE, null)
+        // 2. window.open override — routes external URLs through AndroidBridge
+        wv.evaluateJavascript(DesktopModeJS.WINDOW_OPEN_OVERRIDE, null)
+    }
+
+    // =====================================================================
+    // JavaScript injections — page loaded (onPageFinished)
+    // =====================================================================
+
+    /**
+     * Injected after VS Code's page finishes loading.
+     *
+     * This fires from [VSCodroidWebViewClient.onPageFinished]. At this point
+     * VS Code's DOM is ready and we can safely inject CSS and install bridges
+     * that wait for VS Code's module registry to be available.
+     */
     private fun injectBridgeToken() {
+        val wv = webView ?: return
         val token = securityManager.getSessionToken()
-        webView?.evaluateJavascript(
+
+        // 1. Expose auth token on window.__vscodroid
+        wv.evaluateJavascript(
             "window.__vscodroid = window.__vscodroid || {}; window.__vscodroid.authToken = '$token';",
             null
         )
-        // Install JS interceptor so ExtraKeyRow Ctrl/Alt modifiers apply to soft keyboard input
+
+        // 2. Desktop CSS — enforce desktop proportions regardless of pointer type
+        wv.evaluateJavascript(DesktopModeJS.DESKTOP_CSS, null)
+
+        // 3. Safe area CSS — handle round-corner devices and display cutouts
+        injectSafeAreaCSS()
+
+        // 4. Context menu bridge — exposes fireContextMenu() called by long-press handler
+        wv.evaluateJavascript(DesktopModeJS.CONTEXT_MENU_BRIDGE, null)
+
+        // 5. Memory pressure handler
+        wv.evaluateJavascript(DesktopModeJS.MEMORY_PRESSURE_HANDLER, null)
+
+        // 6. BroadcastChannel relay (Web Worker → AndroidBridge)
+        wv.evaluateJavascript(DesktopModeJS.BRIDGE_RELAY, null)
+
+        // 7. Command palette registrations (Open in Browser, SSH, About, VSIX, Folder)
+        wv.evaluateJavascript(DesktopModeJS.PALETTE_COMMANDS, null)
+
+        // 8. Keyboard modifier interceptor for ExtraKeyRow
         extraKeyRow?.keyInjector?.setupModifierInterceptor()
-        // Process pending file open intent from cold start (must run after VS Code loads)
+
+        // 9. Process any pending file-open intent from cold-start
         pendingFileUri?.let { uri ->
             pendingFileUri = null
             handleIntent(Intent().apply { data = uri })
         }
-        // Inject safe area CSS for round-corner devices
-        injectSafeAreaCSS()
-        // Set up BroadcastChannel relay so browser extensions can reach AndroidBridge
-        injectBridgeRelay()
-        // Register memory pressure listener
-        injectMemoryPressureHandler()
-        // Fix #2: Inject touch target enlargement CSS for phone-sized screens
-        injectTouchTargetCSS()
-        // Fix #7: Override window.open() to route through AndroidBridge
-        injectWindowOpenOverride()
-        // Open in Browser command for dev server preview
-        injectOpenInBrowserCommand()
-        // SSH key management commands
-        injectSshKeyCommands()
-        // About dialog
-        injectAboutCommand()
     }
 
     /**
-     * Injects CSS into VS Code to handle round-corner device safe areas.
+     * Injects safe-area padding CSS for round-corner and notched devices.
      *
-     * Adds padding to the Activity Bar (left sidebar) and Status Bar (bottom)
-     * so content isn't clipped by the device's rounded display corners.
-     * Uses CSS `env(safe-area-inset-*)` with fallback padding.
+     * Uses CSS `env(safe-area-inset-*)` so VS Code's chrome components respect
+     * the device's display cutout. Applied separately from [DesktopModeJS.DESKTOP_CSS]
+     * because safe-area values are device-specific and need the viewport meta tag
+     * to be present first.
      */
     private fun injectSafeAreaCSS() {
-        webView?.evaluateJavascript(
-            """
-            (function() {
-                if (document.getElementById('vscodroid-safe-area-css')) return;
-
-                // Ensure viewport-fit=cover meta tag exists
-                var meta = document.querySelector('meta[name="viewport"]');
-                if (meta) {
-                    var content = meta.getAttribute('content') || '';
-                    if (content.indexOf('viewport-fit') === -1) {
-                        meta.setAttribute('content', content + ', viewport-fit=cover');
-                    }
-                } else {
-                    meta = document.createElement('meta');
-                    meta.name = 'viewport';
-                    meta.content = 'width=device-width, initial-scale=1.0, viewport-fit=cover';
-                    document.head.appendChild(meta);
-                }
-
-                var style = document.createElement('style');
-                style.id = 'vscodroid-safe-area-css';
-                style.textContent = [
-                    '/* VSCodroid: Safe area padding for round-corner devices */',
-                    '.part.activitybar {',
-                    '  padding-left: env(safe-area-inset-left, 0px);',
-                    '  padding-top: env(safe-area-inset-top, 0px);',
-                    '}',
-                    '.part.statusbar {',
-                    '  padding-left: env(safe-area-inset-left, 0px);',
-                    '  padding-right: env(safe-area-inset-right, 0px);',
-                    '  padding-bottom: env(safe-area-inset-bottom, 0px);',
-                    '}',
-                    '.part.titlebar {',
-                    '  padding-top: env(safe-area-inset-top, 0px);',
-                    '  padding-right: env(safe-area-inset-right, 0px);',
-                    '}',
-                    '.part.sidebar {',
-                    '  padding-left: env(safe-area-inset-left, 0px);',
-                    '}',
-                    '.part.panel {',
-                    '  padding-bottom: env(safe-area-inset-bottom, 0px);',
-                    '}'
-                ].join('\n');
-                document.head.appendChild(style);
-            })();
-            """.trimIndent(),
-            null
-        )
+        webView?.evaluateJavascript("""
+(function() {
+    if (document.getElementById('vscodroid-safe-area-css')) return;
+    // Ensure viewport-fit=cover so env(safe-area-inset-*) is non-zero on notched devices
+    var meta = document.querySelector('meta[name="viewport"]');
+    if (meta) {
+        var content = meta.getAttribute('content') || '';
+        if (content.indexOf('viewport-fit') === -1) {
+            meta.setAttribute('content', content + ', viewport-fit=cover');
+        }
+    } else {
+        meta = document.createElement('meta');
+        meta.name = 'viewport';
+        meta.content = 'width=device-width, initial-scale=1.0, viewport-fit=cover';
+        document.head.appendChild(meta);
+    }
+    var style = document.createElement('style');
+    style.id = 'vscodroid-safe-area-css';
+    style.textContent = [
+        '.part.activitybar { padding-left: env(safe-area-inset-left, 0px); }',
+        '.part.statusbar { padding-left: env(safe-area-inset-left, 0px); padding-right: env(safe-area-inset-right, 0px); padding-bottom: env(safe-area-inset-bottom, 0px); }',
+        '.part.titlebar { padding-right: env(safe-area-inset-right, 0px); }',
+        '.part.sidebar { padding-left: env(safe-area-inset-left, 0px); }',
+        '.part.panel { padding-bottom: env(safe-area-inset-bottom, 0px); }'
+    ].join('\n');
+    document.head.appendChild(style);
+})();""", null)
     }
 
-    /**
-     * Fix #2: Injects CSS to enlarge touch targets for phone-sized screens.
-     * Only active when screen width < 600px (phones, not tablets).
-     * Targets WCAG 2.5.5 minimum 44×44px for primary actions, 36px for list items.
-     */
-    private fun injectTouchTargetCSS() {
-        webView?.evaluateJavascript(
-            """
-            (function() {
-                if (document.getElementById('vscodroid-touch-css')) return;
-                if (window.innerWidth > 600) return;
-                var s = document.createElement('style');
-                s.id = 'vscodroid-touch-css';
-                s.textContent = [
-                    '/* VSCodroid: Enlarged touch targets for mobile */',
-                    '.monaco-list-row { min-height: 36px !important; padding: 2px 0 !important; }',
-                    '.tabs-container .tab { min-height: 40px !important; }',
-                    '.activitybar .action-item { min-height: 44px !important; min-width: 44px !important; }',
-                    '.activitybar .action-label { min-height: 44px !important; }',
-                    '.statusbar-item { min-height: 32px !important; padding: 0 8px !important; }',
-                    '.context-view .action-item { min-height: 40px !important; }',
-                    '.context-view .action-label { padding: 6px 12px !important; }',
-                    '.slider { min-width: 12px !important; }',
-                    '.quick-input-list .monaco-list-row { min-height: 36px !important; }'
-                ].join('\n');
-                document.head.appendChild(s);
-            })();
-            """.trimIndent(),
-            null
+    // =====================================================================
+    // WebView recreation
+    // =====================================================================
+
+    private fun recreateWebView() {
+        Logger.w(tag, "Recreating WebView after render process crash")
+        val wv = webView ?: return
+        val lastUrl = wv.url
+        val container = findViewById<android.widget.FrameLayout>(R.id.webViewContainer)
+        container.removeView(wv)
+        wv.destroy()
+
+        val newWebView = VSCodroidWebViewComponent(this)
+        newWebView.id = R.id.webView
+        container.addView(newWebView, 0,
+            android.view.ViewGroup.LayoutParams(
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                android.view.ViewGroup.LayoutParams.MATCH_PARENT
+            )
         )
+        webView = newWebView
+        bridgeInitialized = false
+
+        setupWebView()
+        if (serverPort > 0) {
+            if (lastUrl != null && lastUrl.startsWith("http://127.0.0.1")) {
+                newWebView.loadUrl(lastUrl)
+            } else {
+                loadVSCode(serverPort)
+            }
+        }
     }
 
-    /**
-     * Fix #7: Overrides window.open() to route external URLs through AndroidBridge.
-     * VS Code web's link handling (Markdown preview, "Open in Browser") calls window.open(),
-     * which is blocked by shouldOverrideUrlLoading. This intercepts at the JS level instead.
-     */
-    private fun injectWindowOpenOverride() {
-        webView?.evaluateJavascript(
-            """
-            (function() {
-                if (window.__vscodroidOpenPatched) return;
-                window.__vscodroidOpenPatched = true;
-                var orig = window.open;
-                window.open = function(url) {
-                    if (url && /^https?:/.test(url) && typeof AndroidBridge !== 'undefined') {
-                        var t = (window.__vscodroid || {}).authToken;
-                        if (t) { AndroidBridge.openExternalUrl(url, t); return null; }
-                    }
-                    return orig.apply(window, arguments);
-                };
-            })();
-            """.trimIndent(),
-            null
-        )
+    // =====================================================================
+    // Background resume
+    // =====================================================================
+
+    private fun handleResumeFromBackground() {
+        val ts = backgroundedAt
+        if (ts == 0L || serverPort == 0) return
+        backgroundedAt = 0
+        if (nodeService?.isServerRunning() != true) return
+
+        val bgMs = SystemClock.elapsedRealtime() - ts
+        when {
+            bgMs > FORCE_RELOAD_THRESHOLD_MS -> {
+                Logger.i(tag, "Reloading after ${bgMs / 1000}s background")
+                webView?.reload()
+            }
+            bgMs > HEALTH_CHECK_THRESHOLD_MS -> checkConnectionHealth(bgMs)
+        }
     }
 
-    /**
-     * Injects a "VSCodroid: Open in Browser" command into VS Code's command palette.
-     * Lets developers open localhost dev server URLs (Vite, NestJS, etc.) in the
-     * device's browser for preview. Also registers Ctrl+Shift+B as a shortcut.
-     */
-    private fun injectOpenInBrowserCommand() {
-        webView?.evaluateJavascript(
-            """
-            (function() {
-                if (window.__vscodroidOpenInBrowserRegistered) return;
-                window.__vscodroidOpenInBrowserRegistered = true;
-
-                // Wait for VS Code's command registry to be available
-                var attempts = 0;
-                var interval = setInterval(function() {
-                    attempts++;
-                    if (attempts > 50) { clearInterval(interval); return; }
-                    try {
-                        // Access VS Code's internal command service via the workbench API
-                        var cs = window.require('vs/platform/commands/common/commands');
-                        if (!cs || !cs.CommandsRegistry) return;
-
-                        cs.CommandsRegistry.registerCommand('vscodroid.openInBrowser', function(accessor) {
-                            var qs = accessor.get(window.require('vs/platform/quickinput/common/quickInput').IQuickInputService);
-                            var inputBox = qs.createInputBox();
-                            inputBox.title = 'Open in Browser';
-                            inputBox.placeholder = 'http://localhost:5173';
-                            inputBox.prompt = 'Enter URL to open in device browser';
-                            inputBox.value = 'http://localhost:';
-                            inputBox.onDidAccept(function() {
-                                var url = inputBox.value.trim();
-                                inputBox.dispose();
-                                if (!url) return;
-                                // Add http:// if no scheme provided
-                                if (!/^https?:\/\//.test(url)) url = 'http://' + url;
-                                var t = (window.__vscodroid || {}).authToken;
-                                if (t && typeof AndroidBridge !== 'undefined') {
-                                    AndroidBridge.openExternalUrl(url, t);
-                                }
-                            });
-                            inputBox.onDidHide(function() { inputBox.dispose(); });
-                            inputBox.show();
-                        });
-
-                        // Register in the command palette (Action)
-                        var ar = window.require('vs/platform/actions/common/actions');
-                        if (ar && ar.MenuRegistry && ar.MenuId) {
-                            ar.MenuRegistry.appendMenuItem(ar.MenuId.CommandPalette, {
-                                command: {
-                                    id: 'vscodroid.openInBrowser',
-                                    title: 'VSCodroid: Open in Browser'
-                                }
-                            });
-                        }
-
-                        // Register keyboard shortcut: Ctrl+Shift+O (unused in web)
-                        var kb = window.require('vs/platform/keybinding/common/keybindingsRegistry');
-                        if (kb && kb.KeybindingsRegistry) {
-                            var kc = window.require('vs/base/common/keyCodes');
-                            if (kc && kc.KeyMod && kc.KeyCode) {
-                                kb.KeybindingsRegistry.registerKeybindingRule({
-                                    id: 'vscodroid.openInBrowser',
-                                    weight: 200,
-                                    primary: kc.KeyMod.CtrlCmd | kc.KeyMod.Shift | kc.KeyCode.KeyB,
-                                    when: null
-                                });
-                            }
-                        }
-
-                        clearInterval(interval);
-                    } catch(e) {
-                        // VS Code not ready yet, retry
-                    }
-                }, 200);
-            })();
-            """.trimIndent(),
-            null
-        )
+    private fun checkConnectionHealth(bgMs: Long) {
+        val wv = webView ?: return
+        wv.evaluateJavascript("""
+(function() {
+    var dialogs = document.querySelectorAll('.monaco-dialog-box');
+    for (var i = 0; i < dialogs.length; i++) {
+        var t = (dialogs[i].textContent || '').toLowerCase();
+        if (t.indexOf('reconnect') >= 0 || t.indexOf('lost') >= 0) {
+            console.warn('[VSCodroid] Connection lost, reloading');
+            window.location.reload();
+            return 'reload:connection-lost';
+        }
+    }
+    try {
+        var req = indexedDB.open('vscode-web-db');
+        req.onerror = function() { console.warn('[VSCodroid] IndexedDB broken, reloading'); window.location.reload(); };
+        req.onsuccess = function() { req.result.close(); };
+    } catch(e) { window.location.reload(); return 'reload:idb-exception'; }
+    return 'ok';
+})()""") { result -> Logger.i(tag, "Health check after ${bgMs / 1000}s: ${result?.trim('"')}") }
     }
 
-    /**
-     * Injects SSH key management commands into VS Code's command palette:
-     * - "VSCodroid: Generate SSH Key" — generates ed25519 key pair
-     * - "VSCodroid: Copy SSH Public Key" — copies public key to clipboard
-     */
-    private fun injectSshKeyCommands() {
-        webView?.evaluateJavascript(
-            """
-            (function() {
-                if (window.__vscodroidSshCommandsRegistered) return;
-                window.__vscodroidSshCommandsRegistered = true;
+    // =====================================================================
+    // Deep link callbacks
+    // =====================================================================
 
-                var attempts = 0;
-                var interval = setInterval(function() {
-                    attempts++;
-                    if (attempts > 50) { clearInterval(interval); return; }
-                    try {
-                        var cs = window.require('vs/platform/commands/common/commands');
-                        if (!cs || !cs.CommandsRegistry) return;
-                        var ns = window.require('vs/platform/notification/common/notification');
-                        var ar = window.require('vs/platform/actions/common/actions');
-
-                        // -- Generate SSH Key --
-                        cs.CommandsRegistry.registerCommand('vscodroid.generateSshKey', function(accessor) {
-                            var token = (window.__vscodroid || {}).authToken;
-                            if (!token || typeof AndroidBridge === 'undefined') return;
-                            var notif = accessor.get(ns.INotificationService);
-                            try {
-                                var result = JSON.parse(AndroidBridge.generateSshKey(token, ''));
-                                if (result.success) {
-                                    var msg = result.existed
-                                        ? 'SSH key already exists.'
-                                        : 'SSH key generated!';
-                                    msg += '\n' + result.publicKey;
-                                    notif.info(msg);
-                                } else {
-                                    notif.error('SSH key generation failed: ' + (result.error || 'unknown'));
-                                }
-                            } catch(e) {
-                                notif.error('SSH key generation failed: ' + e);
-                            }
-                        });
-
-                        // -- Copy SSH Public Key --
-                        cs.CommandsRegistry.registerCommand('vscodroid.copySshPublicKey', function(accessor) {
-                            var token = (window.__vscodroid || {}).authToken;
-                            if (!token || typeof AndroidBridge === 'undefined') return;
-                            var notif = accessor.get(ns.INotificationService);
-                            var pubKey = AndroidBridge.getSshPublicKey(token);
-                            if (pubKey) {
-                                AndroidBridge.copyToClipboard(pubKey);
-                                notif.info('SSH public key copied to clipboard.');
-                            } else {
-                                notif.warn('No SSH key found. Use "VSCodroid: Generate SSH Key" first.');
-                            }
-                        });
-
-                        // Register in command palette
-                        if (ar && ar.MenuRegistry && ar.MenuId) {
-                            ar.MenuRegistry.appendMenuItem(ar.MenuId.CommandPalette, {
-                                command: { id: 'vscodroid.generateSshKey', title: 'VSCodroid: Generate SSH Key' }
-                            });
-                            ar.MenuRegistry.appendMenuItem(ar.MenuId.CommandPalette, {
-                                command: { id: 'vscodroid.copySshPublicKey', title: 'VSCodroid: Copy SSH Public Key' }
-                            });
-                        }
-
-                        clearInterval(interval);
-                    } catch(e) {
-                        // VS Code not ready yet, retry
-                    }
-                }, 200);
-            })();
-            """.trimIndent(),
-            null
-        )
+    private fun handleExtensionCallback(uri: Uri) {
+        val dataParam = uri.getQueryParameter("data") ?: return
+        Logger.i(tag, "Extension callback relay received")
+        val escaped = org.json.JSONObject.quote(dataParam)
+        webView?.evaluateJavascript("""
+(function() {
+    try {
+        var d = JSON.parse(decodeURIComponent($escaped));
+        var key = 'vscode-web.url-callbacks[' + d.id + ']';
+        var value = JSON.stringify(d.uri);
+        localStorage.setItem(key, value);
+        window.dispatchEvent(new StorageEvent('storage', {
+            key: key, newValue: value, oldValue: null,
+            storageArea: localStorage, url: window.location.href
+        }));
+    } catch(e) { console.error('[VSCodroid] Callback relay error:', e); }
+})();""", null)
     }
 
-    /**
-     * Injects a BroadcastChannel relay into the WebView main page.
-     *
-     * Browser extensions (which run in a Web Worker) cannot access AndroidBridge
-     * directly because addJavascriptInterface only injects into the main page context.
-     * This relay listens on a BroadcastChannel and forwards calls to AndroidBridge,
-     * bridging the gap between the Web Worker and the main page.
-     */
-    private fun injectBridgeRelay() {
+    private fun handleOAuthCallback(uri: Uri) {
+        val code = uri.getQueryParameter("code") ?: return
+        val state = uri.getQueryParameter("state") ?: return
+        Logger.i(tag, "OAuth callback received (state=$state)")
+        val escapedCode = org.json.JSONObject.quote(code)
+        val escapedState = org.json.JSONObject.quote(state)
         webView?.evaluateJavascript(
-            """
-            (function() {
-                if (typeof AndroidBridge === 'undefined') return;
-                if (window.__vscodroidRelayActive) return;
-                window.__vscodroidRelayActive = true;
-                var ch = new BroadcastChannel('vscodroid-bridge');
-                ch.onmessage = function(e) {
-                    var d = e.data;
-                    var token = (window.__vscodroid || {}).authToken;
-                    if (!token || !d || !d.cmd) return;
-                    try {
-                        var result;
-                        if (d.cmd === 'openFolderPicker') {
-                            AndroidBridge.openFolderPicker(token);
-                            ch.postMessage({id: d.id, ok: true});
-                        } else if (d.cmd === 'getRecentFolders') {
-                            result = AndroidBridge.getRecentFolders(token);
-                            ch.postMessage({id: d.id, ok: true, data: result});
-                        } else if (d.cmd === 'openRecentFolder') {
-                            AndroidBridge.openRecentFolder(token, d.uri);
-                            ch.postMessage({id: d.id, ok: true});
-                        } else if (d.cmd === 'getStorageBreakdown') {
-                            result = AndroidBridge.getStorageBreakdown(token);
-                            ch.postMessage({id: d.id, ok: true, data: result});
-                        } else if (d.cmd === 'clearCaches') {
-                            result = AndroidBridge.clearCaches(token);
-                            ch.postMessage({id: d.id, ok: true, data: result});
-                        } else if (d.cmd === 'generateBugReport') {
-                            result = AndroidBridge.generateBugReport(token);
-                            ch.postMessage({id: d.id, ok: true, data: result});
-                        } else if (d.cmd === 'startGitHubAuth') {
-                            AndroidBridge.startGitHubAuth(d.url, token);
-                            ch.postMessage({id: d.id, ok: true});
-                        } else if (d.cmd === 'openToolchainSettings') {
-                            AndroidBridge.openToolchainSettings(token);
-                            ch.postMessage({id: d.id, ok: true});
-                        } else if (d.cmd === 'generateSshKey') {
-                            result = AndroidBridge.generateSshKey(token, d.comment || '');
-                            ch.postMessage({id: d.id, ok: true, data: result});
-                        } else if (d.cmd === 'getSshPublicKey') {
-                            result = AndroidBridge.getSshPublicKey(token);
-                            ch.postMessage({id: d.id, ok: true, data: result});
-                        } else if (d.cmd === 'listSshKeys') {
-                            result = AndroidBridge.listSshKeys(token);
-                            ch.postMessage({id: d.id, ok: true, data: result});
-                        } else if (d.cmd === 'showAboutDialog') {
-                            AndroidBridge.showAboutDialog(token);
-                            ch.postMessage({id: d.id, ok: true});
-                        } else if (d.cmd === 'openExternalUrl') {
-                            AndroidBridge.openExternalUrl(d.url, token);
-                            ch.postMessage({id: d.id, ok: true});
-                        }
-                    } catch(err) {
-                        ch.postMessage({id: d.id, ok: false, error: String(err)});
-                    }
-                };
-            })();
-            """.trimIndent(),
-            null
-        )
+            "window.__vscodroid?.onOAuthCallback?.($escapedCode, $escapedState)", null)
     }
 
-    /**
-     * Fix #9: Register a consumer for the onLowMemory JS callback.
-     * MainActivity.onTrimMemory already fires window.__vscodroid?.onLowMemory?.(level),
-     * but no consumer was registered. This method registers one.
-     */
-    private fun injectMemoryPressureHandler() {
-        webView?.evaluateJavascript(
-            """
-            (function() {
-                if (window.__vscodroidMemoryHandlerActive) return;
-                window.__vscodroidMemoryHandlerActive = true;
-                window.__vscodroid = window.__vscodroid || {};
-                window.__vscodroid.onLowMemory = function(level) {
-                    console.warn('[VSCodroid] Memory pressure: level=' + level);
-                    // Hint GC and reduce image cache
-                    try {
-                        if (typeof gc === 'function') gc();
-                    } catch(e) {}
-                    // Clear any cached blob URLs
-                    try {
-                        var perf = performance.getEntries();
-                        perf.forEach(function(e) {
-                            if (e.name && e.name.startsWith('blob:')) {
-                                try { URL.revokeObjectURL(e.name); } catch(x) {}
-                            }
-                        });
-                    } catch(e) {}
-                };
-            })();
-            """.trimIndent(),
-            null
-        )
+    private fun handleIntent(intent: Intent) {
+        val uri = intent.data ?: return
+        Logger.i(tag, "Received intent with URI: $uri")
+        val escaped = org.json.JSONObject.quote(uri.toString())
+        webView?.evaluateJavascript("window.__vscodroid?.onFileOpen?.($escaped)", null)
     }
 
-    /**
-     * Shows the About dialog. Called from AndroidBridge via JS.
-     */
+    // =====================================================================
+    // About dialog
+    // =====================================================================
+
     fun showAboutDialog() {
         val versionName = try {
             packageManager.getPackageInfo(packageName, 0).versionName
-        } catch (_: Exception) {
-            "unknown"
-        }
-        val version = getString(R.string.about_version_format, versionName)
-        val disclaimer = getString(R.string.legal_disclaimer)
+        } catch (_: Exception) { "unknown" }
 
         AlertDialog.Builder(this)
             .setTitle(getString(R.string.about_title))
-            .setMessage("$version\n\n$disclaimer")
+            .setMessage("${getString(R.string.about_version_format, versionName)}\n\n${getString(R.string.legal_disclaimer)}")
             .setPositiveButton("OK", null)
             .setNeutralButton("Source Code") { _, _ ->
                 startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/rmyndharis/VSCodroid")))
@@ -942,182 +702,51 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    /**
-     * Injects a "VSCodroid: About" command into VS Code's command palette.
-     */
-    private fun injectAboutCommand() {
-        webView?.evaluateJavascript(
-            """
-            (function() {
-                if (window.__vscodroidAboutRegistered) return;
-                window.__vscodroidAboutRegistered = true;
+    // =====================================================================
+    // Health checks
+    // =====================================================================
 
-                var attempts = 0;
-                var interval = setInterval(function() {
-                    attempts++;
-                    if (attempts > 50) { clearInterval(interval); return; }
-                    try {
-                        var cs = window.require('vs/platform/commands/common/commands');
-                        if (!cs || !cs.CommandsRegistry) return;
-                        var ar = window.require('vs/platform/actions/common/actions');
-
-                        cs.CommandsRegistry.registerCommand('vscodroid.about', function() {
-                            var token = (window.__vscodroid || {}).authToken;
-                            if (token && typeof AndroidBridge !== 'undefined') {
-                                AndroidBridge.showAboutDialog(token);
-                            }
-                        });
-
-                        if (ar && ar.MenuRegistry && ar.MenuId) {
-                            ar.MenuRegistry.appendMenuItem(ar.MenuId.CommandPalette, {
-                                command: { id: 'vscodroid.about', title: 'VSCodroid: About' }
-                            });
-                        }
-                        clearInterval(interval);
-                    } catch(e) {}
-                }, 200);
-            })();
-            """.trimIndent(),
-            null
-        )
-    }
-
-    private fun recreateWebView() {
-        Logger.w(tag, "Recreating WebView after crash")
-        val wv = webView ?: return
-        // Fix #4: Preserve last URL for folder context restoration
-        val lastUrl = wv.url
-        val container = findViewById<android.widget.FrameLayout>(R.id.webViewContainer)
-        container.removeView(wv)
-        wv.destroy()
-
-        val newWebView = WebView(this)
-        newWebView.id = R.id.webView
-        container.addView(newWebView, 0)
-        webView = newWebView
-
-        // Reset bridge so initBridge() re-registers on the new WebView
-        bridgeInitialized = false
-
-        setupWebView()
-        if (serverPort > 0) {
-            // Restore last URL if it was a localhost VS Code URL (preserves folder context)
-            if (lastUrl != null && lastUrl.startsWith("http://127.0.0.1")) {
-                webView?.loadUrl(lastUrl)
-            } else {
-                loadVSCode(serverPort)
-            }
-        }
-    }
-
-    /**
-     * Relays an extension auth callback from Chrome into the WebView's localStorage.
-     *
-     * VS Code's callback.html writes auth tokens to localStorage, but on Android
-     * the callback opens in Chrome while the workbench runs in WebView — separate
-     * localStorage domains. This method receives the token data via deep link
-     * (vscodroid://callback?data=ENCODED_JSON) and injects it into the WebView's
-     * localStorage so the workbench can pick it up.
-     */
-    private fun handleExtensionCallback(uri: Uri) {
-        val dataParam = uri.getQueryParameter("data") ?: return
-        Logger.i(tag, "Extension callback relay received")
-        val escaped = org.json.JSONObject.quote(dataParam)
-        webView?.evaluateJavascript("""
-            (function() {
-                try {
-                    var d = JSON.parse(decodeURIComponent($escaped));
-                    var key = 'vscode-web.url-callbacks[' + d.id + ']';
-                    var value = JSON.stringify(d.uri);
-                    localStorage.setItem(key, value);
-                    // Dispatch synthetic StorageEvent — VS Code's workbench monitors
-                    // localStorage via addEventListener("storage"), but that event only
-                    // fires when ANOTHER browsing context writes. Since evaluateJavascript
-                    // runs in the same context, we must dispatch it manually.
-                    window.dispatchEvent(new StorageEvent('storage', {
-                        key: key, newValue: value, oldValue: null,
-                        storageArea: localStorage, url: window.location.href
-                    }));
-                    console.log('[VSCodroid] Callback relay: injected token for id=' + d.id);
-                } catch(e) {
-                    console.error('[VSCodroid] Callback relay error:', e);
-                }
-            })();
-        """.trimIndent(), null)
-    }
-
-    /**
-     * Forwards an OAuth callback deep link to VS Code's authentication handler.
-     * URL format: vscodroid://oauth/github?code=XXX&state=YYY
-     */
-    private fun handleOAuthCallback(uri: Uri) {
-        val code = uri.getQueryParameter("code")
-        val state = uri.getQueryParameter("state")
-        if (code == null || state == null) {
-            Logger.w(tag, "OAuth callback missing code or state: $uri")
-            return
-        }
-        Logger.i(tag, "OAuth callback received (state=$state)")
-        // Forward to VS Code's auth handler via JS.
-        // Use JSONObject.quote() for complete escaping (handles \u2028, \u2029, etc.)
-        val escapedCode = org.json.JSONObject.quote(code)
-        val escapedState = org.json.JSONObject.quote(state)
-        webView?.evaluateJavascript(
-            "window.__vscodroid?.onOAuthCallback?.($escapedCode, $escapedState)", null
-        )
-    }
-
-    /**
-     * Shows a dialog if the app crashed in a previous session.
-     */
     private fun checkPreviousCrash() {
         if (!CrashReporter.hasPendingCrash()) return
         val lastCrash = CrashReporter.getLastCrash() ?: return
-        // Truncate for display
-        val preview = if (lastCrash.length > 500) lastCrash.take(500) + "\n..." else lastCrash
+        val preview = if (lastCrash.length > 500) lastCrash.take(500) + "\n…" else lastCrash
         AlertDialog.Builder(this)
             .setTitle("VSCodroid crashed")
             .setMessage("The app crashed in a previous session.\n\n$preview")
             .setPositiveButton("Dismiss") { _, _ -> CrashReporter.clearCrashLogs() }
             .setNeutralButton("Copy Report") { _, _ ->
                 val report = CrashReporter.generateBugReport(this)
-                val clipboard = getSystemService(android.content.ClipboardManager::class.java)
-                clipboard.setPrimaryClip(android.content.ClipData.newPlainText("VSCodroid Bug Report", report))
-                Toast.makeText(this, "Bug report copied to clipboard", Toast.LENGTH_SHORT).show()
+                val cb = getSystemService(android.content.ClipboardManager::class.java)
+                cb.setPrimaryClip(android.content.ClipData.newPlainText("VSCodroid Bug Report", report))
+                Toast.makeText(this, "Bug report copied", Toast.LENGTH_SHORT).show()
                 CrashReporter.clearCrashLogs()
             }
             .setCancelable(true)
             .show()
     }
 
-    /**
-     * Warns the user if available storage is critically low (<100 MB).
-     */
     private fun checkStorageHealth() {
         if (!StorageManager.isStorageLow(this)) return
         val available = StorageManager.formatSize(StorageManager.getAvailableStorage(this))
-        Toast.makeText(
-            this,
-            "Storage low ($available available). Clear caches in Settings.",
-            Toast.LENGTH_LONG
-        ).show()
+        Toast.makeText(this, "Storage low ($available available). Clear caches in Settings.", Toast.LENGTH_LONG).show()
         Logger.w(tag, "Storage low: $available available")
     }
 
-    private fun handleIntent(intent: Intent) {
-        val uri = intent.data ?: return
-        Logger.i(tag, "Received intent with URI: $uri")
-        val escaped = org.json.JSONObject.quote(uri.toString())
-        webView?.evaluateJavascript(
-            "window.__vscodroid?.onFileOpen?.($escaped)", null
-        )
+    private fun writeMemoryPressure(level: Int) {
+        try {
+            File(cacheDir, "tmp").also { it.mkdirs() }
+                .let { File(it, "vscodroid-memory-pressure").writeText(level.toString()) }
+        } catch (e: Exception) {
+            Logger.d(tag, "Failed to write memory pressure: ${e.message}")
+        }
     }
 
-    companion object {
-        /** Run health check if backgrounded longer than this. */
-        private const val HEALTH_CHECK_THRESHOLD_MS = 60_000L   // 1 minute
+    // =====================================================================
+    // Constants
+    // =====================================================================
 
-        /** Force page reload if backgrounded longer than this. */
-        private const val FORCE_RELOAD_THRESHOLD_MS = 300_000L  // 5 minutes
+    companion object {
+        private const val HEALTH_CHECK_THRESHOLD_MS = 60_000L    // 1 minute
+        private const val FORCE_RELOAD_THRESHOLD_MS = 300_000L   // 5 minutes
     }
 }
