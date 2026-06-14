@@ -1,127 +1,110 @@
 package com.vscodroid.webview
 
 import android.annotation.SuppressLint
-import android.os.Build
 import android.webkit.WebSettings
 import android.webkit.WebView
 import com.vscodroid.util.Logger
 
 /**
- * Configures a [WebView] (or [VSCodroidWebViewComponent]) for hosting the VS Code
- * web workbench with desktop-class rendering behaviour.
+ * Configures a [WebView] for hosting VS Code web workbench.
  *
- * Key principles:
- * - **Desktop user agent**: Overrides Android's default mobile UA so VS Code web
- *   serves the full desktop layout instead of a simplified mobile variant.
- * - **Wide viewport**: Enables `viewport` meta-tag support and disables overview
- *   (fit-to-screen) scaling so VS Code renders at 1:1 pixel ratio.
- * - **No built-in zoom**: Native WebView zoom is disabled; zoom is handled at the
- *   VS Code level via [VSCodroidWebViewComponent]'s pinch-to-zoom handler.
- * - **Text zoom 100%**: Prevents system font-size settings from distorting VS Code's
- *   carefully tuned editor layout.
- * - **Hardware acceleration**: Explicitly set on the WebView view itself (redundant
- *   with the app-level flag but ensures it survives dynamic WebView recreation).
+ * KEY DECISIONS:
+ *
+ * 1. User-agent: We strip " Mobile" from the stock Android WebView UA instead
+ *    of replacing it with a desktop UA entirely. This is important because:
+ *    - Removing "Mobile" stops VS Code's `isMobile` check from triggering
+ *    - Keeping the rest of the Android/Chrome UA ensures VS Code doesn't serve
+ *      unexpected content or hit platform-detection code paths that crash WebView
+ *    - A full Linux desktop UA caused VS Code to fail initialization (white screen)
+ *
+ * 2. loadWithOverviewMode: kept TRUE. Setting it to false with useWideViewPort=true
+ *    causes the page to render at native resolution before VS Code's CSS loads,
+ *    producing a white flash that stays white if any JS error occurs.
+ *
+ * 3. setSupportMultipleWindows: FALSE. VS Code's internal webview panels use iframes,
+ *    not window.open(). Enabling multiple windows changes iframe routing in ways
+ *    that break VS Code's extension panel rendering.
  */
 object VSCodroidWebView {
     private const val TAG = "VSCodroidWebView"
 
-    /**
-     * Desktop Chrome user agent string (Linux, x86_64).
-     *
-     * Using Linux rather than Windows avoids triggering any Windows-specific
-     * code paths in VS Code's platform detection. The version (131) is kept
-     * reasonably current so feature-detection checks pass.
-     *
-     * IMPORTANT: This string must NOT contain "Mobile", "Android", "Tablet",
-     * or "Touch" — all of which trigger VS Code's mobile/compact layout code.
-     */
-    const val DESKTOP_USER_AGENT =
-        "Mozilla/5.0 (X11; Linux x86_64) " +
-        "AppleWebKit/537.36 (KHTML, like Gecko) " +
-        "Chrome/131.0.0.0 Safari/537.36"
-
     @SuppressLint("SetJavaScriptEnabled")
     fun configure(webView: WebView) {
+        // ── User Agent: strip "Mobile" only ─────────────────────────────────
+        // Original UA example: "Mozilla/5.0 (Linux; Android 14; SM-G998B) AppleWebKit/537.36
+        //   (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+        // After strip:        "Mozilla/5.0 (Linux; Android 14; SM-G998B) AppleWebKit/537.36
+        //   (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        //
+        // VS Code checks: userAgent.indexOf('Mobile') >= 0  → must be -1 for desktop mode
+        val originalUA = webView.settings.userAgentString ?: ""
+        val desktopUA  = originalUA
+            .replace(" Mobile Safari/", " Safari/")   // removes "Mobile" from UA string
+            .replace(" Mobile/", "/")                  // catch alternate formats
+        webView.settings.userAgentString = desktopUA
+        Logger.i(TAG, "UA: $desktopUA")
+
         webView.settings.apply {
-            // -- JavaScript & storage --
-            javaScriptEnabled = true
-            domStorageEnabled = true
-            @Suppress("DEPRECATION")
-            databaseEnabled = true
+            // ── JavaScript + storage ─────────────────────────────────────────
+            javaScriptEnabled  = true
+            domStorageEnabled  = true
+            @Suppress("DEPRECATION") databaseEnabled = true
 
-            // -- DESKTOP USER AGENT --
-            // Must be set before any page load. Causes VS Code web to serve the
-            // full desktop workbench instead of the mobile-simplified layout.
-            userAgentString = DESKTOP_USER_AGENT
+            // ── Viewport ─────────────────────────────────────────────────────
+            // useWideViewPort=true  → honour <meta name="viewport">
+            // loadWithOverviewMode=true → fit to screen initially (prevents white flash
+            //   before VS Code's CSS loads)
+            useWideViewPort      = true
+            loadWithOverviewMode = true
 
-            // -- Viewport (desktop-class rendering) --
-            // useWideViewPort=true  → respects <meta name="viewport"> tags
-            // loadWithOverviewMode=false → renders at 100% initial scale, no fit-to-screen
-            // Together: VS Code renders at device native resolution without any scaling.
-            useWideViewPort = true
-            loadWithOverviewMode = false
-
-            // -- Zoom: disabled at WebView level --
-            // VSCodroidWebViewComponent handles pinch-to-zoom by injecting
-            // Ctrl+= / Ctrl+- keyboard events into VS Code's own zoom system.
-            // Enabling native WebView zoom would double-zoom with VS Code's font resize.
+            // ── Zoom ─────────────────────────────────────────────────────────
+            // Disable native WebView zoom; VSCodroidWebViewComponent handles
+            // pinch-to-zoom by injecting Ctrl+=/Ctrl+- into VS Code instead.
             setSupportZoom(false)
-            builtInZoomControls = false
-            displayZoomControls = false
+            builtInZoomControls  = false
+            displayZoomControls  = false
 
-            // Text zoom locked to 100% — system accessibility font-size must not
-            // distort VS Code's monospace editor layout.
+            // Text zoom: lock at 100% so system font-scale can't distort editor layout
             textZoom = 100
 
-            // -- Content access --
-            // allowFileAccess=false: VS Code fetches all resources via HTTP, not file://
-            // allowContentAccess=true: needed for content:// URIs from SAF/file pickers
-            allowFileAccess = false
-            allowContentAccess = true
+            // ── Content access ────────────────────────────────────────────────
+            allowFileAccess    = false  // VS Code uses HTTP, not file://
+            allowContentAccess = true   // needed for content:// URIs from file pickers
 
-            // Mixed content: VS Code server is HTTP (localhost), loads HTTPS resources
-            // (fonts, CDN — intercepted). ALWAYS_ALLOW is required for this config.
+            // Mixed content: server is HTTP (localhost) but loads HTTPS CDN resources
+            // (all intercepted). ALWAYS_ALLOW is required for this configuration.
             mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
 
-            // -- Cache --
+            // ── Cache ────────────────────────────────────────────────────────
             cacheMode = WebSettings.LOAD_DEFAULT
 
-            // -- Media --
+            // ── Media ────────────────────────────────────────────────────────
             mediaPlaybackRequiresUserGesture = false
 
-            // -- Window management --
-            // javaScriptCanOpenWindowsAutomatically=true: VS Code's extension host
-            // needs to open popup windows for OAuth flows.
+            // ── Windows ──────────────────────────────────────────────────────
+            // false: VS Code uses iframes for webview panels, not window.open().
+            // true caused extension panels to route incorrectly.
+            setSupportMultipleWindows(false)
             javaScriptCanOpenWindowsAutomatically = true
-            // setSupportMultipleWindows=true: Required for extension webview panels
-            // (they render in separate window contexts). onCreateWindow fires in
-            // VSCodroidWebChromeClient to route them correctly.
-            setSupportMultipleWindows(true)
 
-            // -- Encoding --
+            // ── Encoding ────────────────────────────────────────────────────
             defaultTextEncodingName = "utf-8"
         }
 
-        // -- Hardware acceleration (explicit on the View level) --
-        // App-level hardwareAccelerated=true in AndroidManifest covers most cases,
-        // but explicitly setting LAYER_TYPE_HARDWARE on the WebView ensures hardware
-        // compositing is used even after dynamic WebView recreation (recreateWebView).
+        // ── Hardware acceleration ─────────────────────────────────────────────
         webView.setLayerType(WebView.LAYER_TYPE_HARDWARE, null)
 
-        // -- Scrollbars --
-        webView.isScrollbarFadingEnabled = true
-        // Vertical scrollbar: VS Code manages its own (Monaco scrollbar), so we hide
-        // Android's to avoid a duplicate bar appearing on the right edge.
-        webView.isVerticalScrollBarEnabled = false
+        // ── Scrollbars ────────────────────────────────────────────────────────
+        // VS Code renders its own Monaco scrollbars; hide Android's duplicates
+        webView.isScrollbarFadingEnabled     = true
+        webView.isVerticalScrollBarEnabled   = false
         webView.isHorizontalScrollBarEnabled = false
-        webView.overScrollMode = WebView.OVER_SCROLL_NEVER
+        webView.overScrollMode               = WebView.OVER_SCROLL_NEVER
 
-        // -- Remote debugging (debug builds only) --
+        // ── Remote debugging ─────────────────────────────────────────────────
         if (Logger.debugEnabled) {
             WebView.setWebContentsDebuggingEnabled(true)
-            Logger.d(TAG, "WebView remote debugging enabled (chrome://inspect)")
+            Logger.d(TAG, "Chrome remote debugging enabled (chrome://inspect)")
         }
-
-        Logger.i(TAG, "WebView configured (UA: desktop Chrome/Linux, wideViewport=true)")
     }
 }
