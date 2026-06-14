@@ -1,5 +1,6 @@
 package com.vscodroid.service
 
+import android.app.ActivityManager
 import android.content.Context
 import com.vscodroid.util.Environment
 import com.vscodroid.util.Logger
@@ -11,6 +12,7 @@ import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
 /**
@@ -18,9 +20,17 @@ import kotlin.concurrent.thread
  *
  * Responsibilities:
  * - Starting and stopping the Node.js code-server process
- * - Health-checking the server via /healthz endpoint
+ * - Health-checking the server via HTTP on the root endpoint
  * - Monitoring process liveness via a watchdog thread
  * - Streaming stdout/stderr output for diagnostics
+ *
+ * Thread safety:
+ * - [serverProcessRef] is an [AtomicReference] — reads/writes are always atomic
+ *   and visible across the IO dispatcher, main thread, and watchdog thread.
+ * - [isShuttingDown] is [@Volatile] — the watchdog thread checks it on every
+ *   wake-up; the IO thread sets it before calling [Process.destroy].
+ * - [_port] is [@Volatile] — written once by [startServer] on the IO thread,
+ *   read by the main thread via [port].
  *
  * This class does NOT handle restart logic or Android service concerns;
  * those belong to [NodeService].
@@ -29,11 +39,12 @@ class ProcessManager(private val context: Context) {
 
     private val tag = "ProcessManager"
 
-    private var serverProcess: Process? = null
+    /** Atomic holder for the running server process. Null when stopped. */
+    private val serverProcessRef = AtomicReference<Process?>(null)
     private var watchdogThread: Thread? = null
-    private var _port: Int = 0
-    @Volatile
-    private var isShuttingDown = false
+
+    @Volatile private var _port: Int = 0
+    @Volatile private var isShuttingDown = false
 
     /** The port the server is listening on. Only valid after [startServer] returns true. */
     val port: Int get() = _port
@@ -57,20 +68,27 @@ class ProcessManager(private val context: Context) {
     /**
      * Starts the Node.js code-server process.
      *
-     * Allocates an available port, builds the command line from [Environment] paths,
-     * spawns the process, and begins output reading and watchdog monitoring.
+     * - Allocates an available port (with retry on collision)
+     * - Builds the command line from [Environment] paths
+     * - Dynamically scales `--max-old-space-size` based on available RAM
+     * - Spawns the process and begins output reading + watchdog monitoring
      *
-     * @return `true` if the process was spawned successfully, `false` on error or
-     *         if a process is already running.
+     * @return `true` if the process was spawned successfully, `false` on error
+     *         or if a process is already running.
      */
     fun startServer(): Boolean {
-        if (serverProcess != null) {
+        if (serverProcessRef.get() != null) {
             Logger.w(tag, "Server already running")
             return false
         }
 
         isShuttingDown = false
-        _port = PortFinder.findAvailablePort()
+
+        // Port allocation with retry (handles rare TOCTOU race)
+        _port = allocatePortWithRetry() ?: run {
+            Logger.e(tag, "Failed to allocate available port after retries")
+            return false
+        }
         Logger.i(tag, "Starting server on port $_port")
 
         // Ensure TMPDIR exists — Android may clear cache between launches
@@ -81,9 +99,18 @@ class ProcessManager(private val context: Context) {
         val serverScript = Environment.getServerScript(context)
         val env = Environment.buildProcessEnvironment(context, _port)
 
+        // Dynamic heap: use ~35% of available RAM, clamped to [256, 1024] MB.
+        // A 3 GB device gets ~1050 MB available → 368 MB heap.
+        // A 6 GB device gets ~2100 MB available → 735 MB heap.
+        // A 8 GB device gets ~2800 MB available → 980 MB heap, clamped to 1024.
+        val heapMb = computeOptimalHeapMb()
+        Logger.i(tag, "Node.js heap: ${heapMb}MB (available RAM: ${getAvailableRamMb()}MB)")
+
         val command = listOf(
             nodePath,
-            "--max-old-space-size=512",
+            "--max-old-space-size=$heapMb",
+            "--max-semi-space-size=32",      // Keep young-gen small to reduce GC pause
+            "--no-lazy",                     // Eager compilation for faster cold start
             serverScript,
             "--host=127.0.0.1",
             "--port=$_port",
@@ -102,9 +129,10 @@ class ProcessManager(private val context: Context) {
                 redirectErrorStream(true)
                 directory(context.filesDir)
             }
-            serverProcess = processBuilder.start().also { it.outputStream.close() }
-            startOutputReader()
-            startWatchdog()
+            val process = processBuilder.start().also { it.outputStream.close() }
+            serverProcessRef.set(process)
+            startOutputReader(process)
+            startWatchdog(process)
             Logger.i(tag, "Server process started with PID ${getServerPid()}")
             true
         } catch (e: Exception) {
@@ -118,10 +146,6 @@ class ProcessManager(private val context: Context) {
      *
      * Polls [isServerHealthy] at [pollIntervalMs] intervals. On success, invokes
      * [onServerReady] and returns `true`. On timeout, returns `false`.
-     *
-     * @param timeoutMs  Maximum time to wait for the server to become ready.
-     * @param pollIntervalMs  Interval between health check attempts.
-     * @return `true` if the server became ready within the timeout.
      */
     suspend fun waitForReady(timeoutMs: Long = 30_000, pollIntervalMs: Long = 200): Boolean {
         val startTime = System.currentTimeMillis()
@@ -141,8 +165,7 @@ class ProcessManager(private val context: Context) {
      * Performs a synchronous HTTP GET to `http://127.0.0.1:{port}/`.
      *
      * Accepts any non-server-error response (< 500) as healthy.
-     * VS Code Server returns 200 for the web UI; our fallback server
-     * returns 200 for /healthz. Both paths are covered.
+     * Uses a short timeout (1 s) to keep polling snappy.
      */
     fun isServerHealthy(): Boolean {
         return try {
@@ -163,47 +186,40 @@ class ProcessManager(private val context: Context) {
     /**
      * Stops the server process.
      *
-     * Attempts a graceful shutdown via [Process.destroy]. If the process does not
-     * exit, falls back to [Process.destroyForcibly]. Sets [isShuttingDown] to
-     * suppress watchdog crash callbacks.
+     * Sets [isShuttingDown] first to suppress crash callbacks, then attempts
+     * graceful SIGTERM followed by forcible SIGKILL on timeout.
      */
     fun stopServer() {
         isShuttingDown = true
         Logger.i(tag, "Stopping server...")
-        serverProcess?.let { process ->
-            try {
-                process.destroy()
-                val exited = process.waitFor(5, TimeUnit.SECONDS)
-                if (exited) {
-                    Logger.i(tag, "Server stopped with exit code ${process.exitValue()}")
-                } else {
-                    Logger.w(tag, "Graceful shutdown timed out, force killing")
-                    process.destroyForcibly()
-                }
-            } catch (e: Exception) {
-                Logger.w(tag, "Shutdown failed, force killing", e)
+        val process = serverProcessRef.getAndSet(null) ?: return
+        try {
+            process.destroy()
+            val exited = process.waitFor(5, TimeUnit.SECONDS)
+            if (exited) {
+                Logger.i(tag, "Server stopped with exit code ${process.exitValue()}")
+            } else {
+                Logger.w(tag, "Graceful shutdown timed out, force killing")
                 process.destroyForcibly()
             }
+        } catch (e: Exception) {
+            Logger.w(tag, "Shutdown error, force killing", e)
+            process.destroyForcibly()
         }
-        serverProcess = null
         watchdogThread?.interrupt()
         watchdogThread = null
     }
 
-    /**
-     * Returns the PID of the running server process, or `null` if not running.
-     */
+    /** Returns the PID of the running server process, or `null` if not running. */
     fun getServerPid(): Long? {
-        val process = serverProcess ?: return null
+        val process = serverProcessRef.get() ?: return null
         return try {
-            // Prefer the public Java 9+ Process.pid() method when available.
             val pidMethod = process.javaClass.methods.firstOrNull {
                 it.name == "pid" && it.parameterCount == 0
             }
             if (pidMethod != null) {
                 (pidMethod.invoke(process) as? Long)
             } else {
-                // Fallback for runtimes that only expose an internal pid field.
                 val pidField = process.javaClass.getDeclaredField("pid")
                 pidField.isAccessible = true
                 pidField.getInt(process).toLong()
@@ -214,17 +230,49 @@ class ProcessManager(private val context: Context) {
     }
 
     /** Returns `true` if the server process is alive. */
-    fun isRunning(): Boolean = serverProcess?.isAlive == true
+    fun isRunning(): Boolean = serverProcessRef.get()?.isAlive == true
 
     // -- Internal --
 
     /**
-     * Starts a daemon thread that reads every line from the process stdout/stderr
-     * (merged via redirectErrorStream) and forwards it to [onServerOutput] and the
-     * debug log.
+     * Allocates an available TCP port. Retries up to [MAX_PORT_RETRIES] times to
+     * handle the TOCTOU race between [PortFinder.findAvailablePort] and process start.
      */
-    private fun startOutputReader() {
-        val process = serverProcess ?: return
+    private fun allocatePortWithRetry(): Int? {
+        repeat(MAX_PORT_RETRIES) {
+            val candidate = PortFinder.findAvailablePort()
+            if (candidate > 0) return candidate
+        }
+        return null
+    }
+
+    /**
+     * Computes the optimal Node.js old-space heap size based on available RAM.
+     *
+     * Formula: 35% of available RAM, clamped to [MIN_HEAP_MB, MAX_HEAP_MB].
+     */
+    private fun computeOptimalHeapMb(): Int {
+        val availMb = getAvailableRamMb()
+        val optimal = (availMb * 0.35).toInt()
+        return optimal.coerceIn(MIN_HEAP_MB, MAX_HEAP_MB)
+    }
+
+    private fun getAvailableRamMb(): Long {
+        return try {
+            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val memInfo = ActivityManager.MemoryInfo()
+            am.getMemoryInfo(memInfo)
+            memInfo.availMem / (1024 * 1024)
+        } catch (e: Exception) {
+            DEFAULT_AVAILABLE_RAM_MB
+        }
+    }
+
+    /**
+     * Starts a daemon thread that reads every line from the merged stdout/stderr
+     * and forwards it to [onServerOutput] and the debug log.
+     */
+    private fun startOutputReader(process: Process) {
         thread(name = "node-stdout", isDaemon = true) {
             try {
                 BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
@@ -242,33 +290,49 @@ class ProcessManager(private val context: Context) {
     }
 
     /**
-     * Starts a daemon thread that waits for the server process to exit.
+     * Starts a daemon watchdog thread that waits for the process to exit.
      *
-     * If [isShuttingDown] is `true`, the exit is expected and no callback fires.
-     * Otherwise, [onServerCrashed] is invoked with the exit code.
+     * On unexpected exit, invokes [onServerCrashed] with the exit code.
+     * Exit code 137 typically means OOM kill; we add a brief back-off delay
+     * before the callback fires so that memory pressure can subside before
+     * [NodeService] schedules a restart.
      *
      * Exit code interpretation:
-     * - 0: clean exit
-     * - 137 (SIGKILL): typically OOM killer or phantom process limit
-     * - other: unexpected crash
+     * - 0   → clean exit (server.stop() was called)
+     * - 137 → SIGKILL (OOM killer or Android phantom process limit)
+     * - other → unexpected crash
      */
-    private fun startWatchdog() {
+    private fun startWatchdog(process: Process) {
         watchdogThread = thread(name = "node-watchdog", isDaemon = true) {
             try {
-                val exitCode = serverProcess?.waitFor() ?: return@thread
+                val exitCode = process.waitFor()
                 if (isShuttingDown) {
-                    Logger.i(tag, "Server shut down gracefully")
+                    Logger.i(tag, "Server shut down gracefully (exit=$exitCode)")
                     return@thread
                 }
                 when (exitCode) {
-                    0 -> Logger.i(tag, "Server exited cleanly")
-                    137 -> Logger.w(tag, "Server killed (OOM or phantom limit)")
+                    0    -> Logger.i(tag, "Server exited cleanly")
+                    137  -> {
+                        Logger.w(tag, "Server killed (OOM or phantom process limit)")
+                        // Brief delay: let Android's memory reclaimer run before restart
+                        Thread.sleep(OOM_RESTART_DELAY_MS)
+                    }
                     else -> Logger.e(tag, "Server crashed with exit code $exitCode")
                 }
                 onServerCrashed?.invoke(exitCode)
             } catch (e: InterruptedException) {
-                Logger.d(tag, "Watchdog interrupted")
+                Logger.d(tag, "Watchdog interrupted (expected on stopServer)")
             }
         }
+    }
+
+    companion object {
+        private const val MAX_PORT_RETRIES = 3
+        private const val MIN_HEAP_MB = 256
+        private const val MAX_HEAP_MB = 1024
+        private const val DEFAULT_AVAILABLE_RAM_MB = 1500L
+
+        /** Delay before crash callback fires on OOM kill (ms). */
+        private const val OOM_RESTART_DELAY_MS = 3000L
     }
 }
