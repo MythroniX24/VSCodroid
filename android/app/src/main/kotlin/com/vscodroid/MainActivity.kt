@@ -290,19 +290,36 @@ class MainActivity : AppCompatActivity() {
     // =====================================================================
 
     private fun setupWebView() {
-        // The view inflated from activity_main.xml is already VSCodroidWebViewComponent
         webView = findViewById(R.id.webView)
         webView?.let { wv ->
             VSCodroidWebView.configure(wv)
-            wv.loadData(
-                """<html><head>
-                   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-                   </head><body style="background:#1e1e1e;color:#888;font-family:sans-serif;
-                   display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
-                   <div style="text-align:center"><h2 style="color:#ccc;">VSCodroid</h2>
-                   <p>Starting server…</p></div></body></html>""",
-                "text/html", "utf-8"
-            )
+            // Dark loading screen — stays visible until VS Code URL loads.
+            // Background matches VS Code's dark theme (#1e1e1e) so there's no
+            // white flash when VS Code's CSS applies after the navigation.
+            wv.loadData("""<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover">
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{width:100%;height:100%;background:#1e1e1e;overflow:hidden}
+  .c{display:flex;flex-direction:column;align-items:center;justify-content:center;
+     height:100vh;color:#858585;font-family:-apple-system,sans-serif}
+  .logo{font-size:28px;color:#cccccc;margin-bottom:16px;letter-spacing:1px}
+  .msg{font-size:14px;margin-bottom:24px}
+  .spinner{width:32px;height:32px;border:3px solid #333;border-top-color:#007acc;
+           border-radius:50%;animation:spin 0.8s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+  <div class="c">
+    <div class="logo">VSCodroid</div>
+    <div class="msg">Starting server…</div>
+    <div class="spinner"></div>
+  </div>
+</body>
+</html>""", "text/html", "utf-8")
         }
     }
 
@@ -417,11 +434,11 @@ class MainActivity : AppCompatActivity() {
         wv.webViewClient = VSCodroidWebViewClient(
             allowedPort = port,
             onCrash = { recreateWebView() },
-            onPageLoaded = { injectBridgeToken() },
-            // onEarlyPageStart: fires in WebViewClient.onPageStarted, BEFORE VS Code JS runs.
-            // This is the only reliable place to override matchMedia / navigator before
-            // VS Code's workbench module loader evaluates them at startup.
-            onEarlyPageStart = { injectEarlyBootPatches() }
+            onPageLoaded = { injectBridgeToken() }
+            // onEarlyPageStart intentionally omitted:
+            // evaluateJavascript() in onPageStarted is unreliable across WebView
+            // versions and runs AFTER VS Code's bundle anyway (JS is queued, not
+            // synchronous). All injections run safely in onPageFinished instead.
         )
 
         // WebChromeClient with file chooser routing.
@@ -461,24 +478,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =====================================================================
-    // JavaScript injections — early boot (onPageStarted)
-    // =====================================================================
-
-    /**
-     * Injected at [onPageStarted], before VS Code's JavaScript executes.
-     *
-     * Order matters: matchMedia must be patched before VS Code's startup code
-     * runs [workbench.esm.html → workbench.js → isMobile detection].
-     */
-    private fun injectEarlyBootPatches() {
-        val wv = webView ?: return
-        // 1. matchMedia override — forces (pointer:fine), (hover:hover), dark scheme
-        wv.evaluateJavascript(DesktopModeJS.MATCH_MEDIA_OVERRIDE, null)
-        // 2. window.open override — routes external URLs through AndroidBridge
-        wv.evaluateJavascript(DesktopModeJS.WINDOW_OPEN_OVERRIDE, null)
-    }
-
-    // =====================================================================
     // JavaScript injections — page loaded (onPageFinished)
     // =====================================================================
 
@@ -493,76 +492,44 @@ class MainActivity : AppCompatActivity() {
         val wv = webView ?: return
         val token = securityManager.getSessionToken()
 
-        // 1. Expose auth token on window.__vscodroid
+        // 1. Expose auth token — must be first so all other injections can use it
         wv.evaluateJavascript(
-            "window.__vscodroid = window.__vscodroid || {}; window.__vscodroid.authToken = '$token';",
-            null
+            "window.__vscodroid=window.__vscodroid||{};" +
+            "window.__vscodroid.authToken='$token';", null
         )
 
-        // 2. Desktop CSS — enforce desktop proportions regardless of pointer type
+        // 2. matchMedia override — makes VS Code render desktop layout.
+        //    Safe here (onPageFinished): VS Code's workbench re-checks matchMedia
+        //    when the window is resized or when layout recalculates. Our override
+        //    takes effect on the next such check and on any new matchMedia() call.
+        wv.evaluateJavascript(DesktopModeJS.MATCH_MEDIA_OVERRIDE, null)
+
+        // 3. Desktop CSS — enforce desktop proportions
         wv.evaluateJavascript(DesktopModeJS.DESKTOP_CSS, null)
 
-        // 3. Safe area CSS — handle round-corner devices and display cutouts
-        injectSafeAreaCSS()
+        // 4. window.open override — external links open in browser
+        wv.evaluateJavascript(DesktopModeJS.WINDOW_OPEN_OVERRIDE, null)
 
-        // 4. Context menu bridge — exposes fireContextMenu() called by long-press handler
+        // 5. Context menu bridge — enables long-press right-click
         wv.evaluateJavascript(DesktopModeJS.CONTEXT_MENU_BRIDGE, null)
 
-        // 5. Memory pressure handler
+        // 6. Memory pressure handler
         wv.evaluateJavascript(DesktopModeJS.MEMORY_PRESSURE_HANDLER, null)
 
-        // 6. BroadcastChannel relay (Web Worker → AndroidBridge)
+        // 7. BroadcastChannel relay for Web Worker → AndroidBridge calls
         wv.evaluateJavascript(DesktopModeJS.BRIDGE_RELAY, null)
 
-        // 7. Command palette registrations (Open in Browser, SSH, About, VSIX, Folder)
+        // 8. Command palette commands (runs async retry loop — safe to fire early)
         wv.evaluateJavascript(DesktopModeJS.PALETTE_COMMANDS, null)
 
-        // 8. Keyboard modifier interceptor for ExtraKeyRow
+        // 9. Extra key row modifier interceptor
         extraKeyRow?.keyInjector?.setupModifierInterceptor()
 
-        // 9. Process any pending file-open intent from cold-start
+        // 10. Process any file-open intent from cold start
         pendingFileUri?.let { uri ->
             pendingFileUri = null
             handleIntent(Intent().apply { data = uri })
         }
-    }
-
-    /**
-     * Injects safe-area padding CSS for round-corner and notched devices.
-     *
-     * Uses CSS `env(safe-area-inset-*)` so VS Code's chrome components respect
-     * the device's display cutout. Applied separately from [DesktopModeJS.DESKTOP_CSS]
-     * because safe-area values are device-specific and need the viewport meta tag
-     * to be present first.
-     */
-    private fun injectSafeAreaCSS() {
-        webView?.evaluateJavascript("""
-(function() {
-    if (document.getElementById('vscodroid-safe-area-css')) return;
-    // Ensure viewport-fit=cover so env(safe-area-inset-*) is non-zero on notched devices
-    var meta = document.querySelector('meta[name="viewport"]');
-    if (meta) {
-        var content = meta.getAttribute('content') || '';
-        if (content.indexOf('viewport-fit') === -1) {
-            meta.setAttribute('content', content + ', viewport-fit=cover');
-        }
-    } else {
-        meta = document.createElement('meta');
-        meta.name = 'viewport';
-        meta.content = 'width=device-width, initial-scale=1.0, viewport-fit=cover';
-        document.head.appendChild(meta);
-    }
-    var style = document.createElement('style');
-    style.id = 'vscodroid-safe-area-css';
-    style.textContent = [
-        '.part.activitybar { padding-left: env(safe-area-inset-left, 0px); }',
-        '.part.statusbar { padding-left: env(safe-area-inset-left, 0px); padding-right: env(safe-area-inset-right, 0px); padding-bottom: env(safe-area-inset-bottom, 0px); }',
-        '.part.titlebar { padding-right: env(safe-area-inset-right, 0px); }',
-        '.part.sidebar { padding-left: env(safe-area-inset-left, 0px); }',
-        '.part.panel { padding-bottom: env(safe-area-inset-bottom, 0px); }'
-    ].join('\n');
-    document.head.appendChild(style);
-})();""", null)
     }
 
     // =====================================================================
