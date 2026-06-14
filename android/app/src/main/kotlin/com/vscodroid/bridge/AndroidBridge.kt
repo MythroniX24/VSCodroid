@@ -25,6 +25,7 @@ class AndroidBridge(
     private val onMinimize: () -> Unit,
     private val onOpenFolderPicker: () -> Unit = {},
     private val onOpenRecentFolder: (Uri) -> Unit = {},
+    private val onOpenVsixPicker: () -> Unit = {},
     private val onShowAbout: () -> Unit = {},
     private val safManager: SafStorageManager? = null
 ) {
@@ -127,6 +128,18 @@ class AndroidBridge(
         if (!security.validateToken(authToken)) return
         Logger.i(tag, "Opening SAF folder picker")
         onOpenFolderPicker()
+    }
+
+    /**
+     * Opens the VSIX file picker so the user can install a VS Code extension
+     * from a local .vsix file. Called from the "Install Extension from VSIX"
+     * command registered by [DesktopModeJS.PALETTE_COMMANDS].
+     */
+    @JavascriptInterface
+    fun openVsixPicker(authToken: String) {
+        if (!security.validateToken(authToken)) return
+        Logger.i(tag, "Opening VSIX file picker")
+        onOpenVsixPicker()
     }
 
     /**
