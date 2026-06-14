@@ -82,9 +82,45 @@ class VSCodroidWebViewClient(
         request: WebResourceRequest,
         error: WebResourceError
     ) {
-        if (request.isForMainFrame) {
-            Logger.e(tag, "Page load error: ${error.errorCode} - ${error.description}")
-        }
+        if (!request.isForMainFrame) return   // sub-resource errors are non-fatal
+
+        val code = error.errorCode
+        val desc = error.description?.toString() ?: "Unknown error"
+        Logger.e(tag, "Main frame load error: $code — $desc (${request.url})")
+
+        // Show a dark error page that matches VS Code's theme.
+        // The Retry button reloads the last attempted URL so the user
+        // doesn't need to restart the app after a transient connection error.
+        val retryUrl  = request.url?.toString()?.let { "\"$it\"" } ?: "location.href"
+        val errorHtml = """<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover">
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{background:#1e1e1e;color:#ccc;font-family:-apple-system,monospace;height:100%}
+  .c{display:flex;flex-direction:column;align-items:center;justify-content:center;
+     height:100vh;padding:32px;text-align:center}
+  h2{color:#f48771;font-size:18px;margin-bottom:12px}
+  p{color:#858585;font-size:13px;margin-bottom:8px;max-width:400px}
+  code{background:#252526;padding:2px 6px;border-radius:3px;font-size:12px}
+  button{margin-top:24px;padding:8px 24px;background:#007acc;color:#fff;border:none;
+         border-radius:4px;font-size:14px;cursor:pointer;min-height:44px;min-width:120px}
+</style>
+</head>
+<body>
+<div class="c">
+  <h2>Connection Error</h2>
+  <p>Could not connect to the VS Code server.</p>
+  <p><code>Error $code: $desc</code></p>
+  <p style="margin-top:16px;font-size:12px">
+    Make sure the server is running. It can take up to 60–90 seconds on first launch.
+  </p>
+  <button onclick="location.href=$retryUrl">Retry</button>
+</div>
+</body>
+</html>"""
+        view.loadData(errorHtml, "text/html", "utf-8")
     }
 
     override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
