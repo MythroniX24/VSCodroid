@@ -1,17 +1,42 @@
 <?xml version="1.0" encoding="utf-8"?>
-<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<!--
+    Main editor layout: hosts the VS Code WebView and Extra Key Row.
+
+    Design decisions:
+    - FrameLayout root so the WebView fills the entire screen and the
+      ExtraKeyRow overlays it at the bottom (gravity=bottom).
+    - VSCodroidWebViewComponent (not plain WebView) adds long-press contextmenu
+      and pinch-to-zoom handling on top of the standard WebView.
+    - System bar insets are applied programmatically in MainActivity using
+      ViewCompat.setOnApplyWindowInsetsListener on the container, not as XML
+      padding, so VS Code's CSS env(safe-area-inset-*) stays accurate.
+-->
+<FrameLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/webViewContainer"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="@color/colorBackground">
 
-    <!-- VS Code Web UI rendered in WebView -->
-    <WebView
+    <!--
+        VS Code Web UI rendered via our custom WebView subclass.
+        VSCodroidWebViewComponent adds:
+          - Long press → contextmenu event (right-click simulation)
+          - Pinch-to-zoom → Ctrl+=/Ctrl+- in VS Code
+          - Touch coordinate tracking for input bridging
+        All WebView settings (UA, viewport, JS, etc.) applied in
+        VSCodroidWebView.configure() called from MainActivity.setupWebView().
+    -->
+    <com.vscodroid.webview.VSCodroidWebViewComponent
         android:id="@+id/webView"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
-    <!-- Extra key row: Tab, Esc, Ctrl, Alt, arrows, brackets, etc. -->
+    <!--
+        Extra key row: Tab, Esc, Ctrl, Alt, Shift, arrows, brackets, symbols.
+        Shown only when the soft keyboard is visible (IME insets detected).
+        Positioned at the bottom of the container, above the keyboard.
+    -->
     <com.vscodroid.keyboard.ExtraKeyRow
         android:id="@+id/extraKeyRow"
         android:layout_width="match_parent"
