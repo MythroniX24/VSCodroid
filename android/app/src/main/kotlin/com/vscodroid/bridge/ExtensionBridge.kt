@@ -3,7 +3,7 @@ package com.vscodroid.bridge
 import android.content.Context
 import android.net.Uri
 import android.webkit.JavascriptInterface
-import com.vscodroid.security.SecurityManager
+import com.vscodroid.bridge.SecurityManager
 import com.vscodroid.util.Environment
 import com.vscodroid.util.Logger
 import org.json.JSONArray
