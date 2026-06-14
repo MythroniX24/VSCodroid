@@ -10,7 +10,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.IBinder
 import android.os.SystemClock
-import android.view.FrameLayout
+import android.widget.FrameLayout
 import android.webkit.ValueCallback
 import android.webkit.WebView
 import android.widget.Toast
