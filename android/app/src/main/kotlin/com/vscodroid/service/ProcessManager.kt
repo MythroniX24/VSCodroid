@@ -20,27 +20,28 @@ import kotlin.concurrent.thread
 /**
  * Manages the Node.js VS Code server process.
  *
- * Launch strategy
- * ───────────────
- * We launch node → server.js (the bootstrap wrapper) rather than server-main.js
- * directly. server.js is responsible for:
- *   • patching product.json (branding, gallery, trusted domains)
- *   • setting up VS Code-specific env vars before forking server-main.js
- *   • forwarding all flags to the fork in the correct SPACE-SEPARATED format
- *     that VS Code's argv parser expects (--flag value, not --flag=value)
+ * ── Arg format ───────────────────────────────────────────────────────────────
+ * All flags passed as --flag=value (NOT space-separated --flag value).
+ * server.js parses with arg.indexOf('=') which only works with = format.
+ * Using space-separated breaks server.js: VS Code gets no port, no paths,
+ * starts with defaults → serves nothing → blank WebView.
  *
- * IMPORTANT: VS Code's server-main.js arg parser requires SPACE-SEPARATED args:
- *     node server-main.js --host 127.0.0.1 --port 13337   ← CORRECT
- *     node server-main.js --host=127.0.0.1 --port=13337   ← SILENTLY IGNORED
- * Passing = format causes VS Code to start with default paths and serve nothing,
- * which is why the WebView shows a white page with no content.
+ * ── Health check ─────────────────────────────────────────────────────────────
+ * We check PORT directly — NOT a side-channel port. This is essential:
+ *   • When vscode-reh is present: server-main.js eventually binds PORT.
+ *     Until then, health checks return "connection refused" → we wait.
+ *     When VS Code is actually ready the check passes → WebView loads.
+ *   • When vscode-reh is absent: fallback server.js binds PORT immediately
+ *     and responds to /healthz.
+ * A side-port health server (PORT+1) would give a false positive the instant
+ * server.js starts, loading the WebView before VS Code is ready on PORT →
+ * connection refused → blank page. That was the bug.
  *
- * Thread safety
- * ─────────────
- * serverProcessRef   AtomicReference   written by startServer(IO) / read by
- *                                      isRunning(main) / watchdog(daemon)
- * isShuttingDown     @Volatile         read by watchdog, written by stopServer
- * _port              @Volatile         written once; read from any thread
+ * ── Thread safety ────────────────────────────────────────────────────────────
+ * serverProcessRef  AtomicReference  written by startServer (IO thread)
+ *                                    read by isRunning (main) / watchdog
+ * isShuttingDown    @Volatile        set by stopServer, read by watchdog
+ * _port             @Volatile        written once, read from any thread
  */
 class ProcessManager(private val context: Context) {
 
@@ -54,7 +55,7 @@ class ProcessManager(private val context: Context) {
 
     val port: Int get() = _port
 
-    var onServerReady:   (() -> Unit)?          = null
+    var onServerReady:   (() -> Unit)?              = null
     var onServerCrashed: ((exitCode: Int) -> Unit)? = null
     var onServerOutput:  ((line: String) -> Unit)?  = null
 
@@ -62,140 +63,135 @@ class ProcessManager(private val context: Context) {
 
     fun startServer(): Boolean {
         if (serverProcessRef.get() != null) {
-            Logger.w(tag, "startServer called while already running — ignoring")
+            Logger.w(tag, "Already running")
             return false
         }
         isShuttingDown = false
 
         // ── Port ──────────────────────────────────────────────────────────────
-        _port = findAvailablePort() ?: run {
-            Logger.e(tag, "No available TCP port after retries")
+        _port = findPort() ?: run {
+            Logger.e(tag, "No free port found")
             return false
         }
 
-        // ── Paths ─────────────────────────────────────────────────────────────
-        val nodePath  = Environment.getNodePath(context)
-        val nodeFile  = File(nodePath)
-
+        // ── Validate binaries ─────────────────────────────────────────────────
+        val nodePath = Environment.getNodePath(context)
+        val nodeFile = File(nodePath)
         if (!nodeFile.exists()) {
-            Logger.e(tag, "libnode.so not found: $nodePath")
+            Logger.e(tag, "libnode.so missing: $nodePath")
             return false
         }
-        if (nodeFile.length() < MIN_VALID_SIZE) {
-            Logger.e(tag, "libnode.so is a placeholder stub (${nodeFile.length()} bytes). " +
-                "A release build is required.")
+        if (nodeFile.length() < MIN_BINARY_SIZE) {
+            Logger.e(tag, "libnode.so is a stub (${nodeFile.length()} bytes). Release build needed.")
             return false
         }
 
         val serverScript = Environment.getServerScript(context)
         if (!File(serverScript).exists()) {
-            Logger.e(tag, "server.js not found: $serverScript")
+            Logger.e(tag, "server.js missing: $serverScript")
             return false
         }
 
-        // ── Pre-launch patches ─────────────────────────────────────────────────
+        // ── Pre-launch ────────────────────────────────────────────────────────
         File(context.cacheDir, "tmp").mkdirs()
-        patchProductJson()      // brand + gallery + trusted domains
+        patchProductJson()
 
         // ── Environment ───────────────────────────────────────────────────────
         val env = Environment.buildProcessEnvironment(context, _port).toMutableMap()
-        env["VSCODE_NLS_CONFIG"]  = """{"locale":"en","availableLanguages":{}}"""
+        env["VSCODE_NLS_CONFIG"]   = """{"locale":"en","availableLanguages":{}}"""
         env["VSCODE_AGENT_FOLDER"] = Environment.getUserDataDir(context)
 
-        // ── Heap ──────────────────────────────────────────────────────────────
-        val heapMb = computeHeapMb()
-        Logger.i(tag, "Starting server on port=$_port heap=${heapMb}MB")
-
         // ── Command ───────────────────────────────────────────────────────────
-        // CRITICAL: VS Code's argv parser requires SPACE-SEPARATED flags.
-        //   WRONG:  --extensions-dir=/path  (= format silently discarded)
-        //   RIGHT:  "--extensions-dir", "/path"  (two separate list elements)
-        // We pass all flags to server.js; it forwards them to server-main.js
-        // via fork(), preserving the space-separated format.
+        // MUST use --flag=value format — server.js arg parser splits on '='
+        // Space-separated (--flag value) silently discards the value.
+        val heapMb = heapMb()
         val command = listOf(
             nodePath,
             "--max-old-space-size=$heapMb",
             serverScript,
-            "--host",            "127.0.0.1",
-            "--port",            "$_port",
+            "--host=127.0.0.1",
+            "--port=$_port",
             "--without-connection-token",
             "--accept-server-license-terms",
-            "--extensions-dir",  Environment.getExtensionsDir(context),
-            "--user-data-dir",   Environment.getUserDataDir(context),
-            "--server-data-dir", Environment.getUserDataDir(context),
-            "--logsPath",        Environment.getLogsDir(context),
-            "--log",             "info"
+            "--extensions-dir=${Environment.getExtensionsDir(context)}",
+            "--user-data-dir=${Environment.getUserDataDir(context)}",
+            "--server-data-dir=${Environment.getUserDataDir(context)}",
+            "--logsPath=${Environment.getLogsDir(context)}",
+            "--log=info"
         )
-        Logger.d(tag, "Command: ${command.joinToString(" ")}")
+        Logger.i(tag, "Port=$_port Heap=${heapMb}MB")
+        Logger.d(tag, "Cmd: ${command.joinToString(" ")}")
 
         // ── Spawn ─────────────────────────────────────────────────────────────
         return try {
-            val pb = ProcessBuilder(command).apply {
-                environment().putAll(env)
-                redirectErrorStream(true)
-                directory(context.filesDir)
-            }
-            val proc = pb.start().also { it.outputStream.close() }
+            val proc = ProcessBuilder(command)
+                .apply {
+                    environment().putAll(env)
+                    redirectErrorStream(true)
+                    directory(context.filesDir)
+                }
+                .start()
+                .also { it.outputStream.close() }
+
             serverProcessRef.set(proc)
             startOutputReader(proc)
             startWatchdog(proc)
-            Logger.i(tag, "Server process started (PID=${readPid(proc) ?: "?"})")
+            Logger.i(tag, "Process started (PID=${pid(proc) ?: "?"})")
             true
         } catch (e: Exception) {
-            Logger.e(tag, "Failed to start server process", e)
+            Logger.e(tag, "Process start failed", e)
             false
         }
     }
 
-    // ── Health + Wait ─────────────────────────────────────────────────────────
+    // ── Health ────────────────────────────────────────────────────────────────
 
     /**
-     * Polls until the server is healthy or [timeoutMs] elapses.
+     * Waits until VS Code is actually ready to serve the WebView.
      *
-     * First launch is slow: product-bundled JS modules JIT-compile,
-     * extension host activates. Allow 120 s.
-     * Subsequent hot-starts are fast (< 5 s usually).
+     * Polls PORT directly — the only authoritative signal:
+     *  • fallback server (no vscode-reh): responds to /healthz immediately
+     *  • VS Code server (vscode-reh present): responds to / after 30–90 s
+     *
+     * Do NOT add a side-port health check here. A side-port would give an
+     * instant false positive and send the WebView to PORT before VS Code
+     * has bound it, producing a blank page.
      */
-    suspend fun waitForReady(timeoutMs: Long = 120_000, pollMs: Long = 700): Boolean {
+    suspend fun waitForReady(timeoutMs: Long = 120_000, pollMs: Long = 800): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
-        var polls = 0
+        var n = 0
         while (System.currentTimeMillis() < deadline) {
             if (isServerHealthy()) {
-                val elapsed = timeoutMs - (deadline - System.currentTimeMillis())
-                Logger.i(tag, "Server healthy in ${elapsed/1000}s ($polls polls)")
+                Logger.i(tag, "Server ready (polls=$n)")
                 onServerReady?.invoke()
                 return true
             }
-            polls++
-            if (polls % 20 == 0) {
+            n++
+            if (n % 15 == 0) {
                 val rem = (deadline - System.currentTimeMillis()) / 1000
-                Logger.d(tag, "Waiting for server… ${rem}s remaining")
+                Logger.d(tag, "Waiting… ${rem}s left")
             }
             delay(pollMs)
         }
-        Logger.e(tag, "Server did not respond within ${timeoutMs/1000}s")
+        Logger.e(tag, "Timed out after ${timeoutMs / 1000}s")
         return false
     }
 
     fun isServerHealthy(): Boolean {
         if (_port == 0) return false
-        // server.js runs a health server on PORT+1 when the full VS Code server
-        // is launched (so the health server doesn't block VS Code from binding PORT).
-        // When vscode-reh is absent, the fallback server runs on PORT itself.
-        // Try both so health check works in both scenarios.
-        return checkEndpoint(_port + 1, "/healthz")   // full VS Code mode
-            || checkEndpoint(_port,     "/healthz")   // fallback mode
-            || checkEndpoint(_port,     "/")          // last resort
+        // /healthz → fallback server responds here
+        // /        → VS Code server responds here (200 or 302)
+        return probe("/healthz") || probe("/")
     }
 
-    private fun checkEndpoint(p: Int, path: String): Boolean = try {
-        val conn = URL("http://127.0.0.1:$p$path").openConnection() as HttpURLConnection
-        conn.connectTimeout = 2000
-        conn.readTimeout    = 2000
-        conn.requestMethod  = "GET"
-        conn.instanceFollowRedirects = false
-        val code = conn.responseCode
-        conn.disconnect()
+    private fun probe(path: String): Boolean = try {
+        val c = URL("http://127.0.0.1:$_port$path").openConnection() as HttpURLConnection
+        c.connectTimeout = 2000
+        c.readTimeout    = 2000
+        c.requestMethod  = "GET"
+        c.instanceFollowRedirects = false
+        val code = c.responseCode
+        c.disconnect()
         code in 100..499
     } catch (_: Exception) { false }
 
@@ -203,19 +199,13 @@ class ProcessManager(private val context: Context) {
 
     fun stopServer() {
         isShuttingDown = true
-        Logger.i(tag, "Stopping server…")
         val proc = serverProcessRef.getAndSet(null) ?: return
+        Logger.i(tag, "Stopping server…")
         try {
             proc.destroy()
-            if (!proc.waitFor(5, TimeUnit.SECONDS)) {
-                Logger.w(tag, "Graceful shutdown timed out — force-killing")
-                proc.destroyForcibly()
-            } else {
-                Logger.i(tag, "Server stopped (exit=${proc.exitValue()})")
-            }
-        } catch (e: Exception) {
-            proc.destroyForcibly()
-        }
+            if (!proc.waitFor(5, TimeUnit.SECONDS)) proc.destroyForcibly()
+            else Logger.i(tag, "Stopped (exit=${proc.exitValue()})")
+        } catch (_: Exception) { proc.destroyForcibly() }
         watchdogThread?.interrupt()
         watchdogThread = null
     }
@@ -224,110 +214,85 @@ class ProcessManager(private val context: Context) {
 
     // ── product.json ──────────────────────────────────────────────────────────
 
-    /**
-     * Patches VS Code's product.json with VSCodroid branding, Open VSX gallery,
-     * and trusted domains. Must run BEFORE server starts so VS Code reads the
-     * patched values at boot time.
-     *
-     * Idempotent — re-patching the same values is safe.
-     */
     private fun patchProductJson() {
-        val file = File(context.filesDir, "server/vscode-reh/product.json")
-        if (!file.exists()) {
-            Logger.d(tag, "product.json not found — skipping patch (vscode-reh not extracted?)")
-            return
-        }
+        val f = File(context.filesDir, "server/vscode-reh/product.json")
+        if (!f.exists()) return
         try {
-            val obj = JSONObject(file.readText())
-            obj.put("nameShort",        "VSCodroid")
-            obj.put("nameLong",         "VSCodroid")
-            obj.put("applicationName",  "vscodroid")
-            obj.put("dataFolderName",   ".vscodroid")
-            obj.put("quality",          "stable")
-            obj.put("enableTelemetry",  false)
-            obj.put("updateUrl",        "")
-            obj.put("extensionsGallery", JSONObject().apply {
-                put("serviceUrl", "https://open-vsx.org/vscode/gallery")
-                put("itemUrl",    "https://open-vsx.org/vscode/item")
-                put("resourceUrlTemplate",
-                    "https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}")
-                put("controlUrl", "")
+            val o = JSONObject(f.readText())
+            o.put("nameShort",       "VSCodroid")
+            o.put("nameLong",        "VSCodroid")
+            o.put("applicationName", "vscodroid")
+            o.put("dataFolderName",  ".vscodroid")
+            o.put("quality",         "stable")
+            o.put("enableTelemetry", false)
+            o.put("updateUrl",       "")
+            o.put("extensionsGallery", JSONObject().apply {
+                put("serviceUrl",          "https://open-vsx.org/vscode/gallery")
+                put("itemUrl",             "https://open-vsx.org/vscode/item")
+                put("resourceUrlTemplate", "https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}")
+                put("controlUrl",          "")
             })
-            obj.put("linkProtectionTrustedDomains", JSONArray().apply {
+            o.put("linkProtectionTrustedDomains", JSONArray().apply {
                 put("https://open-vsx.org")
                 put("https://useblackbox.io")
                 put("https://github.com")
                 put("https://raw.githubusercontent.com")
             })
-            file.writeText(obj.toString(2))
+            f.writeText(o.toString(2))
             Logger.i(tag, "product.json patched")
         } catch (e: Exception) {
-            Logger.w(tag, "product.json patch failed (non-fatal): ${e.message}")
+            Logger.w(tag, "product.json patch failed: ${e.message}")
         }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private fun findAvailablePort(): Int? {
-        repeat(5) {
-            val p = PortFinder.findAvailablePort()
-            if (p > 0) return p
-        }
+    private fun findPort(): Int? {
+        repeat(5) { val p = PortFinder.findAvailablePort(); if (p > 0) return p }
         return null
     }
 
-    private fun computeHeapMb(): Int {
-        val avail = availableRamMb()
-        if (avail <= 0L) return DEFAULT_HEAP_MB
-        return (avail * 0.35).toInt().coerceIn(MIN_HEAP_MB, MAX_HEAP_MB)
+    private fun heapMb(): Int {
+        return try {
+            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val mi = ActivityManager.MemoryInfo().also { am.getMemoryInfo(it) }
+            (mi.availMem / 1_048_576L * 0.35).toInt().coerceIn(MIN_HEAP, MAX_HEAP)
+        } catch (_: Exception) { DEFAULT_HEAP }
     }
 
-    private fun availableRamMb(): Long = try {
-        val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-        ActivityManager.MemoryInfo().also { am.getMemoryInfo(it) }.availMem / 1_048_576L
-    } catch (_: Exception) { 0L }
-
     private fun startOutputReader(proc: Process) {
-        thread(name = "node-stdout", isDaemon = true) {
+        thread(name = "node-out", isDaemon = true) {
             try {
-                BufferedReader(InputStreamReader(proc.inputStream)).use { reader ->
-                    reader.lineSequence().forEach { line ->
-                        Logger.d(tag, "[server] $line")
+                BufferedReader(InputStreamReader(proc.inputStream)).use { r ->
+                    r.lineSequence().forEach { line ->
+                        Logger.d(tag, "[node] $line")
                         onServerOutput?.invoke(line)
                     }
                 }
-            } catch (_: Exception) {
-                if (!isShuttingDown) Logger.w(tag, "Output reader closed")
-            }
+            } catch (_: Exception) { if (!isShuttingDown) Logger.w(tag, "Reader closed") }
         }
     }
 
     private fun startWatchdog(proc: Process) {
-        watchdogThread = thread(name = "node-watchdog", isDaemon = true) {
+        watchdogThread = thread(name = "node-watch", isDaemon = true) {
             try {
                 val code = proc.waitFor()
-                if (isShuttingDown) { Logger.i(tag, "Clean exit ($code)"); return@thread }
-                Logger.w(tag, "Unexpected server exit (code=$code)")
-                if (code == 137) {
-                    Logger.e(tag, "OOM kill or phantom process limit — waiting 3s…")
-                    Thread.sleep(3_000)
-                }
+                if (isShuttingDown) return@thread
+                Logger.w(tag, "Server exited (code=$code)")
+                if (code == 137) Thread.sleep(3_000)   // wait after OOM kill
                 onServerCrashed?.invoke(code)
-            } catch (_: InterruptedException) {
-                Logger.d(tag, "Watchdog interrupted")
-            }
+            } catch (_: InterruptedException) {}
         }
     }
 
-    private fun readPid(proc: Process): Long? = try {
-        val f = proc.javaClass.getDeclaredField("pid").also { it.isAccessible = true }
-        f.getInt(proc).toLong()
+    private fun pid(p: Process): Long? = try {
+        p.javaClass.getDeclaredField("pid").also { it.isAccessible = true }.getInt(p).toLong()
     } catch (_: Exception) { null }
 
     companion object {
-        private const val MIN_VALID_SIZE  = 1_024L   // stubs are 0 bytes
-        private const val DEFAULT_HEAP_MB = 512
-        private const val MIN_HEAP_MB     = 384
-        private const val MAX_HEAP_MB     = 1024
+        private const val MIN_BINARY_SIZE = 1_024L   // 0-byte stubs caught here
+        private const val DEFAULT_HEAP    = 512
+        private const val MIN_HEAP        = 384
+        private const val MAX_HEAP        = 1024
     }
 }
