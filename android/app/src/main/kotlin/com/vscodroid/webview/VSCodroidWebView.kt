@@ -91,6 +91,14 @@ object VSCodroidWebView {
             defaultTextEncodingName = "utf-8"
         }
 
+        // ── Background colour — CRITICAL for no white screen ─────────────────────
+        // VS Code's workbench HTML has a white/transparent body before its CSS
+        // loads (takes 5–30 s on first launch). Without this, users see a white
+        // page the entire time VS Code is initialising.
+        // Setting the WebView background to VS Code's dark colour (#1e1e1e) means
+        // the user sees dark from the first frame until VS Code's own CSS takes over.
+        webView.setBackgroundColor(0xFF1E1E1E.toInt())
+
         // ── Hardware acceleration ─────────────────────────────────────────────
         webView.setLayerType(WebView.LAYER_TYPE_HARDWARE, null)
 
