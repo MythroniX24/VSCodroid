@@ -1,15 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    Main editor layout: hosts the VS Code WebView and Extra Key Row.
+    Main editor layout.
 
-    Design decisions:
-    - FrameLayout root so the WebView fills the entire screen and the
-      ExtraKeyRow overlays it at the bottom (gravity=bottom).
-    - VSCodroidWebViewComponent (not plain WebView) adds long-press contextmenu
-      and pinch-to-zoom handling on top of the standard WebView.
-    - System bar insets are applied programmatically in MainActivity using
-      ViewCompat.setOnApplyWindowInsetsListener on the container, not as XML
-      padding, so VS Code's CSS env(safe-area-inset-*) stays accurate.
+    Dark background on every layer prevents white flash:
+      Window background  →  #1e1e1e (themes.xml windowBackground)
+      FrameLayout        →  #1e1e1e (below)
+      WebView            →  #1e1e1e (VSCodroidWebView.configure setBackgroundColor)
+
+    All three must be dark. If any layer is missing, a white flash appears for
+    the 5-30 seconds it takes VS Code's CSS to apply its dark theme after load.
 -->
 <FrameLayout
     xmlns:android="http://schemas.android.com/apk/res/android"
@@ -19,23 +18,21 @@
     android:background="@color/colorBackground">
 
     <!--
-        VS Code Web UI rendered via our custom WebView subclass.
         VSCodroidWebViewComponent adds:
-          - Long press → contextmenu event (right-click simulation)
-          - Pinch-to-zoom → Ctrl+=/Ctrl+- in VS Code
-          - Touch coordinate tracking for input bridging
-        All WebView settings (UA, viewport, JS, etc.) applied in
-        VSCodroidWebView.configure() called from MainActivity.setupWebView().
+          • Long press (550ms) → contextmenu event (right-click simulation)
+          • Pinch-to-zoom → Ctrl+= / Ctrl+- in VS Code editor
+        All WebView settings applied in VSCodroidWebView.configure() at startup.
+        Background color #1e1e1e set programmatically via setBackgroundColor().
     -->
     <com.vscodroid.webview.VSCodroidWebViewComponent
         android:id="@+id/webView"
         android:layout_width="match_parent"
-        android:layout_height="match_parent" />
+        android:layout_height="match_parent"
+        android:background="@color/colorBackground" />
 
     <!--
-        Extra key row: Tab, Esc, Ctrl, Alt, Shift, arrows, brackets, symbols.
-        Shown only when the soft keyboard is visible (IME insets detected).
-        Positioned at the bottom of the container, above the keyboard.
+        Extra key row: Tab, Esc, Ctrl, Alt, arrows, brackets etc.
+        Visibility managed by MainActivity based on IME insets.
     -->
     <com.vscodroid.keyboard.ExtraKeyRow
         android:id="@+id/extraKeyRow"
