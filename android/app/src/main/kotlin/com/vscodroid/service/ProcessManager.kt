@@ -20,31 +20,27 @@ import kotlin.concurrent.thread
 /**
  * Manages the Node.js VS Code server process.
  *
- * ─── WHY WE LAUNCH server-main.js DIRECTLY ─────────────────────────────────
+ * Launch strategy
+ * ───────────────
+ * We launch node → server.js (the bootstrap wrapper) rather than server-main.js
+ * directly. server.js is responsible for:
+ *   • patching product.json (branding, gallery, trusted domains)
+ *   • setting up VS Code-specific env vars before forking server-main.js
+ *   • forwarding all flags to the fork in the correct SPACE-SEPARATED format
+ *     that VS Code's argv parser expects (--flag value, not --flag=value)
  *
- * The original design ran:
- *   libnode.so → server.js → fork() → server-main.js
+ * IMPORTANT: VS Code's server-main.js arg parser requires SPACE-SEPARATED args:
+ *     node server-main.js --host 127.0.0.1 --port 13337   ← CORRECT
+ *     node server-main.js --host=127.0.0.1 --port=13337   ← SILENTLY IGNORED
+ * Passing = format causes VS Code to start with default paths and serve nothing,
+ * which is why the WebView shows a white page with no content.
  *
- * This creates a GRANDCHILD process. Android 12+ "Phantom Process Killer"
- * (PhantomProcessRecord) monitors and kills grandchild processes that are not
- * owned by a foreground service. Our foreground service (NodeService) protects
- * the direct child (libnode.so → server.js) but not its fork.
- *
- * New design:
- *   libnode.so → server-main.js   (single process, no fork)
- *
- * We handle the setup that server.js used to do here in Kotlin:
- *  • product.json patching (brand + Open VSX gallery + trusted domains)
- *  • VSCODE_NLS_CONFIG env var injection
- *  • Fallback to server.js's minimal HTTP health server if vscode-reh
- *    hasn't been built/extracted yet
- *
- * ─── THREAD SAFETY ───────────────────────────────────────────────────────────
- * serverProcessRef   AtomicReference  written by startServer (IO), read by
- *                                     isRunning (main), stopServer (main),
- *                                     watchdog (daemon thread)
- * isShuttingDown     @Volatile        read by watchdog; written by stopServer
- * _port              @Volatile        written once by startServer; read anywhere
+ * Thread safety
+ * ─────────────
+ * serverProcessRef   AtomicReference   written by startServer(IO) / read by
+ *                                      isRunning(main) / watchdog(daemon)
+ * isShuttingDown     @Volatile         read by watchdog, written by stopServer
+ * _port              @Volatile         written once; read from any thread
  */
 class ProcessManager(private val context: Context) {
 
@@ -58,22 +54,12 @@ class ProcessManager(private val context: Context) {
 
     val port: Int get() = _port
 
-    // ── Callbacks ─────────────────────────────────────────────────────────────
-    var onServerReady: (() -> Unit)? = null
+    var onServerReady:   (() -> Unit)?          = null
     var onServerCrashed: ((exitCode: Int) -> Unit)? = null
-    var onServerOutput: ((line: String) -> Unit)? = null
+    var onServerOutput:  ((line: String) -> Unit)?  = null
 
     // ── Start ─────────────────────────────────────────────────────────────────
 
-    /**
-     * Starts the VS Code server process.
-     *
-     * Selects the launch target in priority order:
-     *  1. [serverMainPath] (vscode-reh/out/server-main.js) — full VS Code, no fork
-     *  2. [serverJsPath]   (server/server.js)              — minimal health server
-     *
-     * @return true if the process was spawned; false on any error.
-     */
     fun startServer(): Boolean {
         if (serverProcessRef.get() != null) {
             Logger.w(tag, "startServer called while already running — ignoring")
@@ -83,175 +69,129 @@ class ProcessManager(private val context: Context) {
 
         // ── Port ──────────────────────────────────────────────────────────────
         _port = findAvailablePort() ?: run {
-            Logger.e(tag, "No available TCP port found after retries")
+            Logger.e(tag, "No available TCP port after retries")
             return false
         }
-        Logger.i(tag, "Allocated port: $_port")
 
         // ── Paths ─────────────────────────────────────────────────────────────
-        val nodePath = Environment.getNodePath(context)
-        val nodeFile = File(nodePath)
+        val nodePath  = Environment.getNodePath(context)
+        val nodeFile  = File(nodePath)
+
         if (!nodeFile.exists()) {
-            Logger.e(tag, "libnode.so not found at $nodePath — APK may not include native libs")
+            Logger.e(tag, "libnode.so not found: $nodePath")
             return false
         }
-        if (nodeFile.length() < MIN_NODE_BINARY_SIZE) {
-            Logger.e(tag, "libnode.so is a stub (${nodeFile.length()} bytes < $MIN_NODE_BINARY_SIZE). " +
-                "A release build with the real Node.js binary is required.")
+        if (nodeFile.length() < MIN_VALID_SIZE) {
+            Logger.e(tag, "libnode.so is a placeholder stub (${nodeFile.length()} bytes). " +
+                "A release build is required.")
             return false
         }
 
-        // Ensure tmp dir exists (Android clears cache between launches)
+        val serverScript = Environment.getServerScript(context)
+        if (!File(serverScript).exists()) {
+            Logger.e(tag, "server.js not found: $serverScript")
+            return false
+        }
+
+        // ── Pre-launch patches ─────────────────────────────────────────────────
         File(context.cacheDir, "tmp").mkdirs()
-
-        // ── Choose launch target ───────────────────────────────────────────────
-        val serverMainPath = File(context.filesDir, "server/vscode-reh/out/server-main.js")
-        val serverJsPath   = File(context.filesDir, "server/server.js")
-
-        val (targetScript, useDirectLaunch) = when {
-            serverMainPath.exists() -> {
-                Logger.i(tag, "Direct launch: server-main.js (no fork — phantom-process safe)")
-                // Patch product.json BEFORE starting; VS Code reads it at boot
-                patchProductJson()
-                serverMainPath to true
-            }
-            serverJsPath.exists() -> {
-                Logger.w(tag, "server-main.js not found — falling back to minimal server.js")
-                serverJsPath to false
-            }
-            else -> {
-                Logger.e(tag, "Neither server-main.js nor server.js found — assets not extracted")
-                return false
-            }
-        }
+        patchProductJson()      // brand + gallery + trusted domains
 
         // ── Environment ───────────────────────────────────────────────────────
         val env = Environment.buildProcessEnvironment(context, _port).toMutableMap()
-        // Required by VS Code server to locate NLS translations
-        env["VSCODE_NLS_CONFIG"] = """{"locale":"en","availableLanguages":{}}"""
-        // Required for REH mode: tells VS Code we are the web host
+        env["VSCODE_NLS_CONFIG"]  = """{"locale":"en","availableLanguages":{}}"""
         env["VSCODE_AGENT_FOLDER"] = Environment.getUserDataDir(context)
 
         // ── Heap ──────────────────────────────────────────────────────────────
         val heapMb = computeHeapMb()
-        Logger.i(tag, "Heap: ${heapMb}MB  Available RAM: ${availableRamMb()}MB")
+        Logger.i(tag, "Starting server on port=$_port heap=${heapMb}MB")
 
         // ── Command ───────────────────────────────────────────────────────────
-        val command: List<String> = if (useDirectLaunch) {
-            buildDirectCommand(nodePath, heapMb, serverMainPath.absolutePath)
-        } else {
-            buildFallbackCommand(nodePath, heapMb, serverJsPath.absolutePath)
-        }
-        Logger.d(tag, "Launch: ${command.joinToString(" ")}")
+        // CRITICAL: VS Code's argv parser requires SPACE-SEPARATED flags.
+        //   WRONG:  --extensions-dir=/path  (= format silently discarded)
+        //   RIGHT:  "--extensions-dir", "/path"  (two separate list elements)
+        // We pass all flags to server.js; it forwards them to server-main.js
+        // via fork(), preserving the space-separated format.
+        val command = listOf(
+            nodePath,
+            "--max-old-space-size=$heapMb",
+            serverScript,
+            "--host",            "127.0.0.1",
+            "--port",            "$_port",
+            "--without-connection-token",
+            "--accept-server-license-terms",
+            "--extensions-dir",  Environment.getExtensionsDir(context),
+            "--user-data-dir",   Environment.getUserDataDir(context),
+            "--server-data-dir", Environment.getUserDataDir(context),
+            "--logsPath",        Environment.getLogsDir(context),
+            "--log",             "info"
+        )
+        Logger.d(tag, "Command: ${command.joinToString(" ")}")
 
         // ── Spawn ─────────────────────────────────────────────────────────────
         return try {
             val pb = ProcessBuilder(command).apply {
                 environment().putAll(env)
-                redirectErrorStream(true)        // merge stderr → stdout → single reader
-                directory(context.filesDir)      // CWD = filesDir (matches server.js expectation)
+                redirectErrorStream(true)
+                directory(context.filesDir)
             }
-            val proc = pb.start().also {
-                it.outputStream.close()          // EOF on stdin — server doesn't read it
-            }
+            val proc = pb.start().also { it.outputStream.close() }
             serverProcessRef.set(proc)
             startOutputReader(proc)
             startWatchdog(proc)
-            Logger.i(tag, "Server spawned (PID=${readPid(proc) ?: "?"})")
+            Logger.i(tag, "Server process started (PID=${readPid(proc) ?: "?"})")
             true
         } catch (e: Exception) {
-            Logger.e(tag, "ProcessBuilder.start() failed", e)
+            Logger.e(tag, "Failed to start server process", e)
             false
         }
     }
 
-    /**
-     * Command for direct server-main.js launch (no fork).
-     * Arguments mirror what server.js passes when calling fork(serverMain, args).
-     */
-    private fun buildDirectCommand(
-        nodePath: String, heapMb: Int, serverMainPath: String
-    ): List<String> = listOf(
-        nodePath,
-        "--max-old-space-size=$heapMb",
-        serverMainPath,
-        "--host=127.0.0.1",
-        "--port=$_port",
-        "--without-connection-token",
-        "--accept-server-license-terms",
-        "--extensions-dir=${Environment.getExtensionsDir(context)}",
-        "--user-data-dir=${Environment.getUserDataDir(context)}",
-        "--server-data-dir=${Environment.getUserDataDir(context)}",
-        "--logsPath=${Environment.getLogsDir(context)}",
-        "--log=info"
-    )
-
-    /**
-     * Command for the server.js fallback (minimal health server).
-     * server.js handles its own fork internally in this path.
-     */
-    private fun buildFallbackCommand(
-        nodePath: String, heapMb: Int, serverJsPath: String
-    ): List<String> = listOf(
-        nodePath,
-        "--max-old-space-size=$heapMb",
-        serverJsPath,
-        "--host=127.0.0.1",
-        "--port=$_port",
-        "--without-connection-token",
-        "--accept-server-license-terms",
-        "--extensions-dir=${Environment.getExtensionsDir(context)}",
-        "--user-data-dir=${Environment.getUserDataDir(context)}",
-        "--server-data-dir=${Environment.getUserDataDir(context)}",
-        "--logsPath=${Environment.getLogsDir(context)}",
-        "--log=info"
-    )
-
     // ── Health + Wait ─────────────────────────────────────────────────────────
 
     /**
-     * Polls health endpoints until the server responds or [timeoutMs] elapses.
+     * Polls until the server is healthy or [timeoutMs] elapses.
      *
-     * VS Code server is slow on first launch: it JIT-compiles JS modules,
-     * sets up the extension host, and activates user extensions. Allow 120 s.
-     *
-     * Endpoints tried in order for each poll cycle:
-     *  /healthz  — server.js minimal server
-     *  /         — VS Code web workbench root
+     * First launch is slow: product-bundled JS modules JIT-compile,
+     * extension host activates. Allow 120 s.
+     * Subsequent hot-starts are fast (< 5 s usually).
      */
-    suspend fun waitForReady(timeoutMs: Long = 120_000, pollMs: Long = 600): Boolean {
+    suspend fun waitForReady(timeoutMs: Long = 120_000, pollMs: Long = 700): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
         var polls = 0
         while (System.currentTimeMillis() < deadline) {
             if (isServerHealthy()) {
-                Logger.i(tag, "Server healthy after ${polls * pollMs / 1000}s / $polls polls")
+                val elapsed = timeoutMs - (deadline - System.currentTimeMillis())
+                Logger.i(tag, "Server healthy in ${elapsed/1000}s ($polls polls)")
                 onServerReady?.invoke()
                 return true
             }
             polls++
-            if (polls % 25 == 0) {   // log every ~15 s
-                val remaining = (deadline - System.currentTimeMillis()) / 1000
-                Logger.d(tag, "Still waiting for server... ${remaining}s remaining")
+            if (polls % 20 == 0) {
+                val rem = (deadline - System.currentTimeMillis()) / 1000
+                Logger.d(tag, "Waiting for server… ${rem}s remaining")
             }
             delay(pollMs)
         }
-        Logger.e(tag, "Server did not become healthy within ${timeoutMs / 1000}s")
+        Logger.e(tag, "Server did not respond within ${timeoutMs/1000}s")
         return false
     }
 
-    /** Returns true when any health endpoint returns HTTP 1xx–4xx. */
     fun isServerHealthy(): Boolean {
         if (_port == 0) return false
-        for (path in HEALTH_ENDPOINTS) {
-            if (checkEndpoint(path)) return true
-        }
-        return false
+        // server.js runs a health server on PORT+1 when the full VS Code server
+        // is launched (so the health server doesn't block VS Code from binding PORT).
+        // When vscode-reh is absent, the fallback server runs on PORT itself.
+        // Try both so health check works in both scenarios.
+        return checkEndpoint(_port + 1, "/healthz")   // full VS Code mode
+            || checkEndpoint(_port,     "/healthz")   // fallback mode
+            || checkEndpoint(_port,     "/")          // last resort
     }
 
-    private fun checkEndpoint(path: String): Boolean = try {
-        val conn = URL("http://127.0.0.1:$_port$path").openConnection() as HttpURLConnection
-        conn.connectTimeout = 1500
-        conn.readTimeout    = 1500
+    private fun checkEndpoint(p: Int, path: String): Boolean = try {
+        val conn = URL("http://127.0.0.1:$p$path").openConnection() as HttpURLConnection
+        conn.connectTimeout = 2000
+        conn.readTimeout    = 2000
         conn.requestMethod  = "GET"
         conn.instanceFollowRedirects = false
         val code = conn.responseCode
@@ -268,13 +208,12 @@ class ProcessManager(private val context: Context) {
         try {
             proc.destroy()
             if (!proc.waitFor(5, TimeUnit.SECONDS)) {
-                Logger.w(tag, "Graceful shutdown timed out, force-killing")
+                Logger.w(tag, "Graceful shutdown timed out — force-killing")
                 proc.destroyForcibly()
             } else {
-                Logger.i(tag, "Stopped cleanly (exit=${proc.exitValue()})")
+                Logger.i(tag, "Server stopped (exit=${proc.exitValue()})")
             }
         } catch (e: Exception) {
-            Logger.w(tag, "Shutdown error, force-killing", e)
             proc.destroyForcibly()
         }
         watchdogThread?.interrupt()
@@ -286,53 +225,42 @@ class ProcessManager(private val context: Context) {
     // ── product.json ──────────────────────────────────────────────────────────
 
     /**
-     * Patches VS Code's product.json to inject VSCodroid branding, Open VSX
-     * gallery, and trusted domain list. Called in Kotlin before launch so we
-     * never need server.js to do it (removes dependency on that step).
+     * Patches VS Code's product.json with VSCodroid branding, Open VSX gallery,
+     * and trusted domains. Must run BEFORE server starts so VS Code reads the
+     * patched values at boot time.
      *
-     * Idempotent — re-applying the same values is harmless.
+     * Idempotent — re-patching the same values is safe.
      */
     private fun patchProductJson() {
         val file = File(context.filesDir, "server/vscode-reh/product.json")
         if (!file.exists()) {
-            Logger.d(tag, "product.json not found — skipping patch")
+            Logger.d(tag, "product.json not found — skipping patch (vscode-reh not extracted?)")
             return
         }
         try {
             val obj = JSONObject(file.readText())
-
             obj.put("nameShort",        "VSCodroid")
             obj.put("nameLong",         "VSCodroid")
             obj.put("applicationName",  "vscodroid")
             obj.put("dataFolderName",   ".vscodroid")
             obj.put("quality",          "stable")
-            obj.put("telemetryOptIn",   false)
             obj.put("enableTelemetry",  false)
             obj.put("updateUrl",        "")
-            obj.put("releaseNotesUrl",  "")
-            obj.put("documentationUrl", "")
-            obj.put("feedbackUrl",      "")
-            obj.put("reportIssueUrl",   "")
-
             obj.put("extensionsGallery", JSONObject().apply {
-                put("serviceUrl",              "https://open-vsx.org/vscode/gallery")
-                put("itemUrl",                 "https://open-vsx.org/vscode/item")
+                put("serviceUrl", "https://open-vsx.org/vscode/gallery")
+                put("itemUrl",    "https://open-vsx.org/vscode/item")
                 put("resourceUrlTemplate",
                     "https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}")
-                put("controlUrl",  "")
-                put("nlsBaseUrl",  "")
+                put("controlUrl", "")
             })
-
             obj.put("linkProtectionTrustedDomains", JSONArray().apply {
                 put("https://open-vsx.org")
                 put("https://useblackbox.io")
                 put("https://github.com")
                 put("https://raw.githubusercontent.com")
-                put("https://marketplace.visualstudio.com")
             })
-
             file.writeText(obj.toString(2))
-            Logger.i(tag, "product.json patched successfully")
+            Logger.i(tag, "product.json patched")
         } catch (e: Exception) {
             Logger.w(tag, "product.json patch failed (non-fatal): ${e.message}")
         }
@@ -374,30 +302,19 @@ class ProcessManager(private val context: Context) {
         }
     }
 
-    /**
-     * Daemon thread that waits for the process to exit.
-     *
-     * Exit codes:
-     *  0   → clean shutdown
-     *  1   → JS exception / startup error
-     *  137 → SIGKILL (OOM or phantom process killer)
-     *
-     * On exit code 137 we wait 3 s before notifying so memory pressure
-     * has time to subside before NodeService schedules a restart.
-     */
     private fun startWatchdog(proc: Process) {
         watchdogThread = thread(name = "node-watchdog", isDaemon = true) {
             try {
                 val code = proc.waitFor()
-                if (isShuttingDown) { Logger.i(tag, "Watchdog: clean exit ($code)"); return@thread }
-                Logger.w(tag, "Watchdog: unexpected exit (code=$code)")
+                if (isShuttingDown) { Logger.i(tag, "Clean exit ($code)"); return@thread }
+                Logger.w(tag, "Unexpected server exit (code=$code)")
                 if (code == 137) {
-                    Logger.e(tag, "SIGKILL detected — OOM or phantom process killer. Waiting 3s…")
+                    Logger.e(tag, "OOM kill or phantom process limit — waiting 3s…")
                     Thread.sleep(3_000)
                 }
                 onServerCrashed?.invoke(code)
             } catch (_: InterruptedException) {
-                Logger.d(tag, "Watchdog interrupted (expected during stopServer)")
+                Logger.d(tag, "Watchdog interrupted")
             }
         }
     }
@@ -407,21 +324,10 @@ class ProcessManager(private val context: Context) {
         f.getInt(proc).toLong()
     } catch (_: Exception) { null }
 
-    // ── Constants ─────────────────────────────────────────────────────────────
-
     companion object {
-        /**
-         * Minimum byte-size of a real Node.js binary.
-         * Stub/placeholder libnode.so files used in debug builds are typically 0 bytes.
-         * A real Node.js ARM64 binary is > 20 MB.
-         */
-        private const val MIN_NODE_BINARY_SIZE = 1_024L  // 1 KB — catches 0-byte stubs
-
-        private const val DEFAULT_HEAP_MB =  512
-        private const val MIN_HEAP_MB     =  384
+        private const val MIN_VALID_SIZE  = 1_024L   // stubs are 0 bytes
+        private const val DEFAULT_HEAP_MB = 512
+        private const val MIN_HEAP_MB     = 384
         private const val MAX_HEAP_MB     = 1024
-
-        /** Health check endpoints tried in order each poll cycle. */
-        private val HEALTH_ENDPOINTS = listOf("/healthz", "/")
     }
 }
