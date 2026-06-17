@@ -1,0 +1,118 @@
+name: Build libnode.so
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ONE-TIME SETUP WORKFLOW
+#
+# The app embeds a real Node.js binary cross-compiled for Android ARM64
+# (jniLibs/arm64-v8a/libnode.so). This binary is NOT committed to git (it would
+# be 30-90 MB) and is NOT something build.yml / release.yml can build inline —
+# they only ever DOWNLOAD a prebuilt copy from a GitHub Release in this repo.
+#
+# If no such release exists yet (e.g. a fresh fork), build.yml now FAILS LOUDLY
+# instead of silently creating a non-functional 64-byte placeholder file (which
+# is exactly what caused "Failed to start the server" / "Server took too long
+# to start" on every launch, no matter what app code changed).
+#
+# Run this workflow ONCE (Actions tab → Build libnode.so → Run workflow). It
+# cross-compiles Node.js inside Docker (toolchains/build-node.sh's Docker
+# fallback path — no local NDK/Docker setup needed on your machine, it all runs
+# on GitHub's runner) and publishes the result to a release tagged
+# "libnode-prebuilt". After that, every future build.yml / release.yml run
+# will find and use it automatically. Takes roughly 30-90 minutes.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: "Rebuild even if a valid libnode.so release already exists"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  check-existing:
+    name: Check for existing libnode.so release
+    runs-on: ubuntu-latest
+    outputs:
+      already_valid: ${{ steps.check.outputs.already_valid }}
+    steps:
+      - name: Check release
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          rm -f /tmp/libnode.so
+          if gh release download libnode-prebuilt --repo "$REPO" \
+               --pattern "libnode.so" --dir /tmp --clobber 2>/dev/null; then
+            SIZE="$(wc -c < /tmp/libnode.so)"
+            echo "Existing libnode-prebuilt asset size: $SIZE bytes"
+            if [ "$SIZE" -gt 1000000 ]; then
+              echo "A valid libnode.so already exists."
+              echo "already_valid=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "No valid existing release found — will build."
+          echo "already_valid=false" >> "$GITHUB_OUTPUT"
+
+  build-libnode:
+    name: Cross-compile Node.js for Android ARM64
+    needs: check-existing
+    if: needs.check-existing.outputs.already_valid != 'true' || github.event.inputs.force_rebuild == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # V8/Node compilation needs disk headroom; GH runners ship with large
+      # preinstalled SDKs (.NET, Android, Haskell) we don't need here.
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          df -h /
+
+      - name: Build libnode.so (Docker cross-compile via Android NDK)
+        run: |
+          echo "This cross-compiles Node.js 20.18.1 for arm64-v8a inside Docker."
+          echo "Expect 30-90 minutes depending on runner load."
+          bash toolchains/build-node.sh
+
+      - name: Verify output
+        run: |
+          LIBNODE="android/app/src/main/jniLibs/arm64-v8a/libnode.so"
+          if [ ! -f "$LIBNODE" ]; then
+            echo "ERROR: build-node.sh did not produce libnode.so"
+            exit 1
+          fi
+          SIZE="$(wc -c < "$LIBNODE")"
+          echo "Built libnode.so: $SIZE bytes"
+          if [ "$SIZE" -lt 1000000 ]; then
+            echo "ERROR: output is only $SIZE bytes — build likely failed silently."
+            exit 1
+          fi
+          file "$LIBNODE" || true
+
+      - name: Publish as GitHub Release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: libnode-prebuilt
+          name: "libnode.so (prebuilt, Android ARM64)"
+          make_latest: false
+          body: |
+            Prebuilt Node.js 20.18.1 binary cross-compiled for Android ARM64.
+
+            Consumed automatically by `build.yml` and `release.yml` via a stable
+            tag lookup (`gh release download libnode-prebuilt --pattern libnode.so`),
+            so it keeps working regardless of how many app version releases exist.
+
+            Rebuilt by re-running the "Build libnode.so" workflow with
+            "force_rebuild" enabled. Do not delete this release.
+          files: android/app/src/main/jniLibs/arm64-v8a/libnode.so
+          
