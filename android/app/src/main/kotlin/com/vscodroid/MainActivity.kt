@@ -11,6 +11,7 @@ import android.os.Bundle
 import android.os.IBinder
 import android.os.SystemClock
 import android.widget.FrameLayout
+import android.webkit.JavascriptInterface
 import android.webkit.ValueCallback
 import android.webkit.WebView
 import android.widget.Toast
@@ -293,10 +294,117 @@ class MainActivity : AppCompatActivity() {
         webView = findViewById(R.id.webView)
         webView?.let { wv ->
             VSCodroidWebView.configure(wv)
-            // Dark loading screen — stays visible until VS Code URL loads.
-            // Background matches VS Code's dark theme (#1e1e1e) so there's no
-            // white flash when VS Code's CSS applies after the navigation.
-            wv.loadData("""<!DOCTYPE html>
+            // StatusBridge is attached IMMEDIATELY (before any server/VS Code bridge
+            // exists) so the Retry button on a Failed-state status page always works,
+            // even on the very first launch before any other JS interface is ready.
+            wv.addJavascriptInterface(StatusBridge(), "VSCodroidStatus")
+            renderStatus(NodeService.ServerState.IDLE)
+        }
+    }
+
+    /**
+     * JavaScript bridge for the pre-VS-Code status/diagnostics pages rendered by
+     * [renderStatus]. Deliberately minimal and attached from the very first frame,
+     * independent of [bridgeInitialized] / [initBridge], so Retry always works even
+     * if the server has never successfully started once.
+     *
+     * [JavascriptInterface] methods run on a background thread, not the UI thread —
+     * every method here must post back via [runOnUiThread] before touching the
+     * Activity, WebView, or Service.
+     */
+    private inner class StatusBridge {
+        @JavascriptInterface
+        fun retry() {
+            runOnUiThread { retryServerStart() }
+        }
+
+        @JavascriptInterface
+        fun copyLogs() {
+            runOnUiThread {
+                val logs = nodeService?.getRecentOutput()?.joinToString("\n") ?: "(no logs available)"
+                val report = buildString {
+                    append("VSCodroid startup diagnostics\n")
+                    append("State: ${nodeService?.getState()}\n")
+                    append("Error: ${nodeService?.getLastError() ?: "(none)"}\n\n")
+                    append("Recent log lines:\n")
+                    append(logs)
+                }
+                val cb = getSystemService(android.content.ClipboardManager::class.java)
+                cb.setPrimaryClip(android.content.ClipData.newPlainText("VSCodroid Diagnostics", report))
+                Toast.makeText(this@MainActivity, "Diagnostics copied to clipboard", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    /**
+     * Forces a fresh server start attempt via [NodeService.ACTION_RETRY],
+     * bypassing the service's `isServiceRunning` guard (which would otherwise
+     * silently no-op a second [startForegroundService] call).
+     */
+    private fun retryServerStart() {
+        Logger.i(tag, "User requested retry")
+        renderStatus(NodeService.ServerState.STARTING)
+        startService(Intent(this, NodeService::class.java).apply {
+            action = NodeService.ACTION_RETRY
+        })
+    }
+
+    /**
+     * Renders the current startup state as a self-contained HTML page via
+     * [WebView.loadData] — never a real network navigation, so this ALWAYS
+     * renders even when the server itself is completely broken (e.g. no usable
+     * libnode.so). This is what guarantees a blank/white screen can never happen:
+     * every state has a corresponding visible page, including [ServerState.FAILED],
+     * which shows the EXACT failure reason, a Retry button, and a "Copy Diagnostics"
+     * button surfacing recent server log lines.
+     *
+     * States rendered:
+     *  IDLE / STARTING            → "Starting runtime…" spinner
+     *  WAITING_FOR_HEALTH         → "Waiting for VS Code server…" spinner
+     *  FAILED                     → error reason + recent logs + Retry + Copy Diagnostics
+     *  READY                      → not rendered here; [loadVSCode] navigates away instead
+     */
+    private fun renderStatus(state: NodeService.ServerState, errorMessage: String? = null) {
+        val wv = webView ?: return
+        if (state == NodeService.ServerState.READY) return  // loadVSCode() handles this
+
+        val (title, subtitle) = when (state) {
+            NodeService.ServerState.IDLE               -> "VSCodroid" to "Preparing…"
+            NodeService.ServerState.STARTING            -> "VSCodroid" to "Starting Node.js runtime…"
+            NodeService.ServerState.WAITING_FOR_HEALTH   -> "VSCodroid" to "Waiting for VS Code server to respond…"
+            NodeService.ServerState.FAILED               -> "Startup Failed" to (errorMessage ?: "Unknown error")
+            NodeService.ServerState.READY                -> "" to ""
+        }
+
+        val isFailed = state == NodeService.ServerState.FAILED
+        val escapedSubtitle = subtitle
+            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace("\n", "<br>")
+
+        val body = if (isFailed) {
+            """
+            <div class="c">
+              <div class="logo err">$title</div>
+              <div class="errbox">$escapedSubtitle</div>
+              <div class="restartinfo">Restart attempts so far: ${nodeService?.getRestartCount() ?: 0}</div>
+              <div class="btnrow">
+                <button onclick="VSCodroidStatus.retry()">Retry</button>
+                <button class="secondary" onclick="VSCodroidStatus.copyLogs()">Copy Diagnostics</button>
+              </div>
+            </div>
+            """.trimIndent()
+        } else {
+            """
+            <div class="c">
+              <div class="logo">$title</div>
+              <div class="msg">$escapedSubtitle</div>
+              <div class="spinner"></div>
+            </div>
+            """.trimIndent()
+        }
+
+        wv.loadData(
+            """<!DOCTYPE html>
 <html>
 <head>
 <meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover">
@@ -304,23 +412,26 @@ class MainActivity : AppCompatActivity() {
   *{margin:0;padding:0;box-sizing:border-box}
   html,body{width:100%;height:100%;background:#1e1e1e;overflow:hidden}
   .c{display:flex;flex-direction:column;align-items:center;justify-content:center;
-     height:100vh;color:#858585;font-family:-apple-system,sans-serif}
-  .logo{font-size:28px;color:#cccccc;margin-bottom:16px;letter-spacing:1px}
+     min-height:100vh;color:#858585;font-family:-apple-system,sans-serif;padding:24px;text-align:center}
+  .logo{font-size:26px;color:#cccccc;margin-bottom:16px;letter-spacing:1px}
+  .logo.err{color:#f48771}
   .msg{font-size:14px;margin-bottom:24px}
+  .errbox{font-size:13px;color:#cccccc;background:#252526;border-radius:6px;padding:16px;
+          margin-bottom:16px;max-width:480px;text-align:left;font-family:monospace;line-height:1.5}
+  .restartinfo{font-size:12px;color:#666;margin-bottom:16px}
   .spinner{width:32px;height:32px;border:3px solid #333;border-top-color:#007acc;
            border-radius:50%;animation:spin 0.8s linear infinite}
   @keyframes spin{to{transform:rotate(360deg)}}
+  .btnrow{display:flex;gap:12px;flex-wrap:wrap;justify-content:center}
+  button{padding:10px 24px;background:#007acc;color:#fff;border:none;border-radius:4px;
+         font-size:14px;cursor:pointer;min-height:44px}
+  button.secondary{background:#3c3c3c;color:#ccc}
 </style>
 </head>
 <body>
-  <div class="c">
-    <div class="logo">VSCodroid</div>
-    <div class="msg">Starting server…</div>
-    <div class="spinner"></div>
-  </div>
+  $body
 </body>
 </html>""", "text/html", "utf-8")
-        }
     }
 
     private fun setupExtraKeyRow() {
@@ -355,23 +466,55 @@ class MainActivity : AppCompatActivity() {
         serviceBindingInitiated = true
     }
 
+    /**
+     * Wires live callbacks AND immediately reconciles the CURRENT truth.
+     *
+     * The reconciliation step (reading [NodeService.getState] / [getLastError]
+     * right after binding) is what closes the race described in [NodeService]'s
+     * kdoc: if the server already failed (or became ready) before this Activity
+     * finished binding, the callback that fired at that moment found a null
+     * listener and was dropped. Without reconciliation, the user would be stuck
+     * looking at a static "Starting…" page forever with no error and no way to
+     * know what happened. Reconciliation guarantees we always render the truth,
+     * regardless of timing.
+     */
     private fun setupServiceCallbacks() {
-        nodeService?.onServerReady = { port ->
-            serverPort = port
-            runOnUiThread { loadVSCode(port) }
-        }
-        nodeService?.onServerError = { message ->
+        val service = nodeService ?: return
+
+        service.onServerReady = { port ->
             runOnUiThread {
-                Logger.e(tag, "Server error: $message")
-                Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+                serverPort = port
+                loadVSCode(port)
             }
         }
-        val service = nodeService ?: return
-        val port = service.getPort()
-        if (port > 0 && service.isServerRunning()) {
-            Logger.i(tag, "Server already running on port $port, loading immediately")
-            serverPort = port
-            loadVSCode(port)
+        service.onServerError = { message ->
+            runOnUiThread {
+                Logger.e(tag, "Server error: $message")
+                renderStatus(NodeService.ServerState.FAILED, message)
+            }
+        }
+        service.onStateChanged = { state ->
+            if (state != NodeService.ServerState.FAILED && state != NodeService.ServerState.READY) {
+                runOnUiThread { renderStatus(state) }
+            }
+        }
+
+        // Reconcile NOW — don't wait for a callback that may have already fired and been dropped.
+        when (service.getState()) {
+            NodeService.ServerState.READY -> {
+                val port = service.getPort()
+                if (port > 0 && service.isServerRunning()) {
+                    Logger.i(tag, "Server already ready on port $port — loading immediately")
+                    serverPort = port
+                    loadVSCode(port)
+                }
+            }
+            NodeService.ServerState.FAILED -> {
+                val reason = service.getLastError() ?: getString(R.string.error_server_start)
+                Logger.w(tag, "Server already in FAILED state on bind: $reason")
+                renderStatus(NodeService.ServerState.FAILED, reason)
+            }
+            else -> renderStatus(service.getState())
         }
     }
 
