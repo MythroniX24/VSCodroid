@@ -56,10 +56,17 @@ jobs:
           restore-keys: |
             downloads-
 
-      # Cache the generated assets directory (extracted, patched VS Code server + tools)
-      # NOTE: this cache key does NOT depend on libnode.so. If a stub was ever
-      # cached here under an older version of this workflow, the "Verify assets"
-      # step below will still catch it on every run, cache hit or not.
+      # Cache the generated assets directory (extracted, patched VS Code server + tools).
+      #
+      # IMPORTANT: jniLibs/arm64-v8a (libnode.so) is DELIBERATELY NOT included here.
+      # It used to be, which meant a 64-byte stub created by an old/buggy run of
+      # this workflow could get cached and silently restored FOREVER on every
+      # subsequent run — "Fetch libnode.so" would be skipped (cache-hit=true) and
+      # the stale stub would persist no matter how many times you re-ran the build,
+      # requiring a manual cache-clear in Settings -> Actions -> Caches to escape.
+      # libnode.so is now fetched fresh on every run (see "Fetch libnode.so" below,
+      # which has no cache-hit guard) — it's a small, fast release-asset download,
+      # not an expensive rebuild, so this costs a few seconds, not minutes.
       - name: Cache generated assets
         id: cache-assets
         uses: actions/cache@v4
@@ -68,7 +75,6 @@ jobs:
             android/app/src/main/assets/vscode-reh/
             android/app/src/main/assets/usr/
             android/app/src/main/assets/extensions/
-            android/app/src/main/jniLibs/arm64-v8a/
             server/vscode-reh/
           key: assets-${{ hashFiles('scripts/download-vscode-server.sh', 'scripts/download-termux-tools.sh', 'scripts/download-npm.sh', 'scripts/download-python.sh', 'scripts/download-extensions.sh', 'scripts/build-node-pty.sh') }}
           restore-keys: |
@@ -116,6 +122,11 @@ jobs:
       # than "latest" — means this keeps working even after real app version
       # releases exist (those become "latest" but don't carry libnode.so).
       #
+      # Runs on EVERY build (no cache-hit guard, unlike the steps above) — this
+      # is a small, fast release-asset download, not an expensive rebuild, so
+      # there is no real cost to always re-verifying it fresh. This is what
+      # prevents a stale/stub libnode.so from ever being silently reused via cache.
+      #
       # If no valid asset can be found anywhere, THE BUILD NOW FAILS HERE.
       # A previous version of this step silently created a 64-byte placeholder
       # file so the build would "succeed" — producing an APK that installs but
@@ -123,7 +134,6 @@ jobs:
       # "Server took too long to start" on every single launch. Never again:
       # see the error message below for the one-time fix.
       - name: Fetch libnode.so
-        if: steps.cache-assets.outputs.cache-hit != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
