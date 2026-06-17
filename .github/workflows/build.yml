@@ -57,6 +57,9 @@ jobs:
             downloads-
 
       # Cache the generated assets directory (extracted, patched VS Code server + tools)
+      # NOTE: this cache key does NOT depend on libnode.so. If a stub was ever
+      # cached here under an older version of this workflow, the "Verify assets"
+      # step below will still catch it on every run, cache hit or not.
       - name: Cache generated assets
         id: cache-assets
         uses: actions/cache@v4
@@ -107,9 +110,18 @@ jobs:
         if: steps.cache-assets.outputs.cache-hit != 'true'
         run: bash scripts/build-node-pty.sh
 
-      # libnode.so: Download pre-built binary from latest GitHub release.
-      # If no release exists yet, create a stub so Gradle can produce an APK
-      # (it will crash at runtime without a real binary).
+      # libnode.so: fetched from a STABLE release tag ("libnode-prebuilt"),
+      # published once by the separate "Build libnode.so" workflow
+      # (.github/workflows/build-libnode.yml). Looking up a fixed tag — rather
+      # than "latest" — means this keeps working even after real app version
+      # releases exist (those become "latest" but don't carry libnode.so).
+      #
+      # If no valid asset can be found anywhere, THE BUILD NOW FAILS HERE.
+      # A previous version of this step silently created a 64-byte placeholder
+      # file so the build would "succeed" — producing an APK that installs but
+      # can never start its server, showing "Failed to start the server" /
+      # "Server took too long to start" on every single launch. Never again:
+      # see the error message below for the one-time fix.
       - name: Fetch libnode.so
         if: steps.cache-assets.outputs.cache-hit != 'true'
         env:
@@ -118,21 +130,49 @@ jobs:
         run: |
           mkdir -p android/app/src/main/jniLibs/arm64-v8a
           LIBNODE="android/app/src/main/jniLibs/arm64-v8a/libnode.so"
-          if [ -f "$LIBNODE" ] && [ "$(wc -c < "$LIBNODE")" -gt 1000 ]; then
-            echo "libnode.so already exists ($(du -sh "$LIBNODE" | cut -f1))"
+
+          if [ -f "$LIBNODE" ] && [ "$(wc -c < "$LIBNODE")" -gt 1000000 ]; then
+            echo "libnode.so already present ($(du -sh "$LIBNODE" | cut -f1))"
             exit 0
           fi
-          echo "Attempting to download libnode.so from latest GitHub release..."
+
+          echo "Trying stable release tag 'libnode-prebuilt'..."
+          if gh release download libnode-prebuilt --repo "$REPO" \
+               --pattern "libnode.so" \
+               --dir android/app/src/main/jniLibs/arm64-v8a/ --clobber 2>/dev/null; then
+            SIZE="$(wc -c < "$LIBNODE")"
+            if [ "$SIZE" -gt 1000000 ]; then
+              echo "Downloaded from libnode-prebuilt ($(du -sh "$LIBNODE" | cut -f1))"
+              exit 0
+            fi
+            echo "Downloaded asset was too small ($SIZE bytes) — ignoring."
+          fi
+
+          echo "Trying latest release (legacy fallback)..."
           if gh release download --repo "$REPO" \
                --pattern "libnode.so" \
-               --dir android/app/src/main/jniLibs/arm64-v8a/ 2>/dev/null; then
-            echo "Downloaded libnode.so ($(du -sh "$LIBNODE" | cut -f1))"
-          else
-            echo "WARNING: libnode.so not found in releases. Creating stub."
-            echo "Build will succeed but APK will not run without a real libnode.so."
-            printf '\x7fELF' > "$LIBNODE"
-            dd if=/dev/zero bs=1 count=60 >> "$LIBNODE" 2>/dev/null
+               --dir android/app/src/main/jniLibs/arm64-v8a/ --clobber 2>/dev/null; then
+            SIZE="$(wc -c < "$LIBNODE")"
+            if [ "$SIZE" -gt 1000000 ]; then
+              echo "Downloaded from latest release ($(du -sh "$LIBNODE" | cut -f1))"
+              exit 0
+            fi
+            echo "Downloaded asset was too small ($SIZE bytes) — ignoring."
           fi
+
+          rm -f "$LIBNODE"
+          echo ""
+          echo "============================================================"
+          echo "ERROR: No usable libnode.so release asset found in this repo."
+          echo ""
+          echo "This build CANNOT produce a working app without a real"
+          echo "Node.js ARM64 binary. One-time fix (~30-90 minutes):"
+          echo "  1. Open the Actions tab of this repository"
+          echo "  2. Select 'Build libnode.so' in the left sidebar"
+          echo "  3. Click 'Run workflow' and wait for it to finish"
+          echo "  4. Re-run this 'Build Debug APK' workflow"
+          echo "============================================================"
+          exit 1
 
       - name: Verify assets
         run: |
@@ -141,6 +181,20 @@ jobs:
           echo ""
           echo "=== jniLibs ==="
           ls -la android/app/src/main/jniLibs/arm64-v8a/ || true
+          echo ""
+          LIBNODE="android/app/src/main/jniLibs/arm64-v8a/libnode.so"
+          if [ ! -f "$LIBNODE" ]; then
+            echo "ERROR: libnode.so missing entirely (final check)."
+            exit 1
+          fi
+          LIBNODE_SIZE="$(wc -c < "$LIBNODE")"
+          if [ "$LIBNODE_SIZE" -lt 1000000 ]; then
+            echo "ERROR: libnode.so is only $LIBNODE_SIZE bytes (final check)."
+            echo "If this came from cache, clear the 'assets-*' cache in"
+            echo "Settings -> Actions -> Caches and re-run."
+            exit 1
+          fi
+          echo "libnode.so OK: $LIBNODE_SIZE bytes"
 
       - name: Build debug APK
         working-directory: android
