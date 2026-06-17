@@ -20,28 +20,27 @@ import kotlin.concurrent.thread
 /**
  * Manages the Node.js VS Code server process.
  *
- * ── Arg format ───────────────────────────────────────────────────────────────
- * All flags passed as --flag=value (NOT space-separated --flag value).
- * server.js parses with arg.indexOf('=') which only works with = format.
- * Using space-separated breaks server.js: VS Code gets no port, no paths,
- * starts with defaults → serves nothing → blank WebView.
+ * ── Diagnostics ──────────────────────────────────────────────────────────────
+ * Every lifecycle event (port chosen, heap size, validation failures, process
+ * output) is appended to an in-memory ring buffer ([recentOutput]) capped at
+ * [MAX_LOG_LINES] lines. [MainActivity] surfaces this buffer in its Failed-state
+ * diagnostics screen so a startup failure is never just a blank page — the exact
+ * reason and recent log lines are always visible to the user.
  *
- * ── Health check ─────────────────────────────────────────────────────────────
- * We check PORT directly — NOT a side-channel port. This is essential:
- *   • When vscode-reh is present: server-main.js eventually binds PORT.
- *     Until then, health checks return "connection refused" → we wait.
- *     When VS Code is actually ready the check passes → WebView loads.
- *   • When vscode-reh is absent: fallback server.js binds PORT immediately
- *     and responds to /healthz.
- * A side-port health server (PORT+1) would give a false positive the instant
- * server.js starts, loading the WebView before VS Code is ready on PORT →
- * connection refused → blank page. That was the bug.
+ * [lastStartFailureReason] holds a precise, human-readable explanation of the
+ * MOST RECENT reason [startServer] returned `false`. This is read by
+ * [NodeService] instead of a generic string resource, so the user sees exactly
+ * what went wrong (e.g. "libnode.so is 64 bytes — placeholder stub, see setup
+ * instructions") rather than "Failed to start development server".
  *
  * ── Thread safety ────────────────────────────────────────────────────────────
- * serverProcessRef  AtomicReference  written by startServer (IO thread)
- *                                    read by isRunning (main) / watchdog
- * isShuttingDown    @Volatile        set by stopServer, read by watchdog
- * _port             @Volatile        written once, read from any thread
+ * serverProcessRef        AtomicReference  written by startServer (IO thread)
+ *                                          read by isRunning (main) / watchdog
+ * isShuttingDown           @Volatile       set by stopServer, read by watchdog
+ * _port                    @Volatile       written once, read from any thread
+ * lastStartFailureReason   @Volatile       written by startServer, read by NodeService
+ * recentOutput             synchronized    appended by output reader thread,
+ *                                          snapshotted by any thread via getRecentOutput()
  */
 class ProcessManager(private val context: Context) {
 
@@ -52,12 +51,30 @@ class ProcessManager(private val context: Context) {
 
     @Volatile private var _port: Int = 0
     @Volatile private var isShuttingDown = false
+    @Volatile private var lastStartFailureReason: String? = null
+
+    private val recentOutput = java.util.Collections.synchronizedList(
+        ArrayDeque<String>(MAX_LOG_LINES)
+    )
 
     val port: Int get() = _port
 
     var onServerReady:   (() -> Unit)?              = null
     var onServerCrashed: ((exitCode: Int) -> Unit)? = null
     var onServerOutput:  ((line: String) -> Unit)?  = null
+
+    /** Precise reason the last [startServer] call returned false, or null if it succeeded / hasn't run. */
+    fun getLastFailureReason(): String? = lastStartFailureReason
+
+    /** Snapshot of the most recent log lines (lifecycle events + process stdout/stderr), oldest first. */
+    fun getRecentOutput(): List<String> = synchronized(recentOutput) { recentOutput.toList() }
+
+    private fun log(line: String) {
+        synchronized(recentOutput) {
+            recentOutput.addLast(line)
+            while (recentOutput.size > MAX_LOG_LINES) recentOutput.removeFirst()
+        }
+    }
 
     // ── Start ─────────────────────────────────────────────────────────────────
 
@@ -67,28 +84,44 @@ class ProcessManager(private val context: Context) {
             return false
         }
         isShuttingDown = false
+        lastStartFailureReason = null
 
         // ── Port ──────────────────────────────────────────────────────────────
         _port = findPort() ?: run {
-            Logger.e(tag, "No free port found")
+            fail("No free TCP port found after ${PORT_RETRIES} attempts.")
             return false
         }
 
-        // ── Validate binaries ─────────────────────────────────────────────────
+        // ── Validate libnode.so ──────────────────────────────────────────────
+        // This is the single most common cause of "server never starts": the
+        // GitHub Actions debug build creates a 64-byte placeholder ELF stub when
+        // it cannot find a `libnode.so` release asset in the repository (see
+        // .github/workflows/build.yml "Fetch libnode.so" step). A stub passes
+        // File.exists() but cannot be executed — exec() fails immediately.
+        // We detect this explicitly so the failure reason is unambiguous instead
+        // of a generic ProcessBuilder IOException.
         val nodePath = Environment.getNodePath(context)
         val nodeFile = File(nodePath)
         if (!nodeFile.exists()) {
-            Logger.e(tag, "libnode.so missing: $nodePath")
+            fail("libnode.so not found at $nodePath. The APK may have been built " +
+                "without native libraries — check jniLibs packaging in build.gradle.kts.")
             return false
         }
-        if (nodeFile.length() < MIN_BINARY_SIZE) {
-            Logger.e(tag, "libnode.so is a stub (${nodeFile.length()} bytes). Release build needed.")
+        val nodeSize = nodeFile.length()
+        if (nodeSize < MIN_VALID_NODE_SIZE) {
+            fail("libnode.so is only $nodeSize bytes — this is a placeholder stub, " +
+                "not a real Node.js binary (expected 30-90 MB). Your GitHub Actions build " +
+                "could not find a 'libnode.so' GitHub Release asset in this repository, so " +
+                "it created a non-functional placeholder instead of failing the build. " +
+                "Fix: run the 'Build libnode.so' workflow once (Actions tab → Build libnode.so " +
+                "→ Run workflow), wait for it to publish a release, then re-run 'Build Debug APK'.")
             return false
         }
 
         val serverScript = Environment.getServerScript(context)
         if (!File(serverScript).exists()) {
-            Logger.e(tag, "server.js missing: $serverScript")
+            fail("server.js not found at $serverScript. Asset extraction may have failed " +
+                "or the APK was built without assets/server.js.")
             return false
         }
 
@@ -102,8 +135,8 @@ class ProcessManager(private val context: Context) {
         env["VSCODE_AGENT_FOLDER"] = Environment.getUserDataDir(context)
 
         // ── Command ───────────────────────────────────────────────────────────
-        // MUST use --flag=value format — server.js arg parser splits on '='
-        // Space-separated (--flag value) silently discards the value.
+        // server.js's bootstrap arg parser splits on '=' — flags MUST use
+        // --flag=value format. Space-separated (--flag value) is silently dropped.
         val heapMb = heapMb()
         val command = listOf(
             nodePath,
@@ -119,7 +152,8 @@ class ProcessManager(private val context: Context) {
             "--logsPath=${Environment.getLogsDir(context)}",
             "--log=info"
         )
-        Logger.i(tag, "Port=$_port Heap=${heapMb}MB")
+        log("Starting: port=$_port heap=${heapMb}MB libnode.so=${nodeSize / 1_048_576}MB")
+        Logger.i(tag, "Port=$_port Heap=${heapMb}MB NodeSize=${nodeSize}B")
         Logger.d(tag, "Cmd: ${command.joinToString(" ")}")
 
         // ── Spawn ─────────────────────────────────────────────────────────────
@@ -139,32 +173,35 @@ class ProcessManager(private val context: Context) {
             Logger.i(tag, "Process started (PID=${pid(proc) ?: "?"})")
             true
         } catch (e: Exception) {
-            Logger.e(tag, "Process start failed", e)
+            fail("ProcessBuilder failed to start node: ${e.javaClass.simpleName}: ${e.message}")
             false
         }
     }
 
+    private fun fail(reason: String) {
+        lastStartFailureReason = reason
+        log("FAILURE: $reason")
+        Logger.e(tag, reason)
+    }
+
     // ── Health ────────────────────────────────────────────────────────────────
 
-    /**
-     * Waits until VS Code is actually ready to serve the WebView.
-     *
-     * Polls PORT directly — the only authoritative signal:
-     *  • fallback server (no vscode-reh): responds to /healthz immediately
-     *  • VS Code server (vscode-reh present): responds to / after 30–90 s
-     *
-     * Do NOT add a side-port health check here. A side-port would give an
-     * instant false positive and send the WebView to PORT before VS Code
-     * has bound it, producing a blank page.
-     */
     suspend fun waitForReady(timeoutMs: Long = 120_000, pollMs: Long = 800): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
         var n = 0
         while (System.currentTimeMillis() < deadline) {
             if (isServerHealthy()) {
+                log("Server healthy after ${n} polls")
                 Logger.i(tag, "Server ready (polls=$n)")
                 onServerReady?.invoke()
                 return true
+            }
+            // If the process died while we were waiting, stop polling immediately —
+            // no point waiting out the full timeout for a process that's gone.
+            val proc = serverProcessRef.get()
+            if (proc != null && !proc.isAlive && !isShuttingDown) {
+                fail("Process exited while waiting for health check (exit=${proc.exitValue()}).")
+                return false
             }
             n++
             if (n % 15 == 0) {
@@ -173,14 +210,12 @@ class ProcessManager(private val context: Context) {
             }
             delay(pollMs)
         }
-        Logger.e(tag, "Timed out after ${timeoutMs / 1000}s")
+        fail("Server did not respond on port $_port within ${timeoutMs / 1000}s (process alive=${isRunning()}).")
         return false
     }
 
     fun isServerHealthy(): Boolean {
         if (_port == 0) return false
-        // /healthz → fallback server responds here
-        // /        → VS Code server responds here (200 or 302)
         return probe("/healthz") || probe("/")
     }
 
@@ -248,7 +283,7 @@ class ProcessManager(private val context: Context) {
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private fun findPort(): Int? {
-        repeat(5) { val p = PortFinder.findAvailablePort(); if (p > 0) return p }
+        repeat(PORT_RETRIES) { val p = PortFinder.findAvailablePort(); if (p > 0) return p }
         return null
     }
 
@@ -266,6 +301,7 @@ class ProcessManager(private val context: Context) {
                 BufferedReader(InputStreamReader(proc.inputStream)).use { r ->
                     r.lineSequence().forEach { line ->
                         Logger.d(tag, "[node] $line")
+                        log(line)
                         onServerOutput?.invoke(line)
                     }
                 }
@@ -279,6 +315,7 @@ class ProcessManager(private val context: Context) {
                 val code = proc.waitFor()
                 if (isShuttingDown) return@thread
                 Logger.w(tag, "Server exited (code=$code)")
+                log("Server process exited unexpectedly (code=$code)")
                 if (code == 137) Thread.sleep(3_000)   // wait after OOM kill
                 onServerCrashed?.invoke(code)
             } catch (_: InterruptedException) {}
@@ -290,9 +327,12 @@ class ProcessManager(private val context: Context) {
     } catch (_: Exception) { null }
 
     companion object {
-        private const val MIN_BINARY_SIZE = 1_024L   // 0-byte stubs caught here
-        private const val DEFAULT_HEAP    = 512
-        private const val MIN_HEAP        = 384
-        private const val MAX_HEAP        = 1024
+        /** Real Node.js ARM64 binaries are 30-90 MB. A stub from a missing release asset is 64 bytes. */
+        private const val MIN_VALID_NODE_SIZE = 1_000_000L   // 1 MB — generous floor, still catches all stubs
+        private const val DEFAULT_HEAP = 512
+        private const val MIN_HEAP     = 384
+        private const val MAX_HEAP     = 1024
+        private const val PORT_RETRIES = 5
+        private const val MAX_LOG_LINES = 300
     }
 }
