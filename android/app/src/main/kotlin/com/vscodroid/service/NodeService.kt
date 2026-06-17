@@ -23,16 +23,20 @@ import kotlinx.coroutines.launch
 /**
  * Foreground Service that owns the Node.js code-server process.
  *
- * Responsibilities:
- * - Promoting itself to a foreground service with a persistent notification
- *   (specialUse FGS type for local dev server)
- * - Delegating process lifecycle to [ProcessManager]
- * - Automatically restarting the server on unexpected crashes (up to [MAX_RESTARTS])
- * - Exposing server state to bound clients (typically [MainActivity])
+ * ── State machine ────────────────────────────────────────────────────────────
+ * [getState] exposes the CURRENT truth at all times via [ServerState], not just
+ * a point-in-time callback. This matters because of a real race: [launchServer]
+ * runs from [onStartCommand], which fires the instant the service is created —
+ * often before [MainActivity] has finished binding and assigned [onServerReady]
+ * / [onServerError]. If the very first [ProcessManager.startServer] call fails
+ * FAST (e.g. a libnode.so size check, which is a synchronous file-stat, not a
+ * slow process spawn), the failure callback can fire while it is still null on
+ * the client side and be silently dropped — the Activity never finds out why,
+ * and is left showing a static "Starting…" page forever.
  *
- * Binding pattern: Activities bind to this service to receive the port number
- * and server readiness callbacks. The service remains alive independently of
- * any bound clients because it is started as a foreground service.
+ * [getState]/[getLastError]/[getRecentOutput] let a newly-bound client query
+ * "what already happened" immediately, closing this race regardless of timing.
+ * Callbacks ([onServerReady]/[onServerError]) remain for LIVE updates after binding.
  */
 class NodeService : Service() {
 
@@ -44,11 +48,21 @@ class NodeService : Service() {
     private var restartCount = 0
     private var isServiceRunning = false
 
+    /** Current lifecycle state. Always reflects the latest known truth. */
+    enum class ServerState { IDLE, STARTING, WAITING_FOR_HEALTH, READY, FAILED }
+
+    @Volatile private var currentState: ServerState = ServerState.IDLE
+    @Volatile private var lastErrorMessage: String? = null
+    @Volatile private var readyPort: Int = 0
+
     /** Invoked when the server is healthy and accepting connections. */
     var onServerReady: ((port: Int) -> Unit)? = null
 
     /** Invoked when the server fails to start or exceeds restart attempts. */
     var onServerError: ((message: String) -> Unit)? = null
+
+    /** Invoked on every state transition, with the new state. Optional — for live UI updates. */
+    var onStateChanged: ((ServerState) -> Unit)? = null
 
     // -- Binder --
 
@@ -72,6 +86,12 @@ class NodeService : Service() {
             ACTION_STOP -> {
                 stopSelf()
                 return START_NOT_STICKY
+            }
+            ACTION_RETRY -> {
+                Logger.i(tag, "Retry requested by client")
+                restartCount = 0
+                launchServer()
+                return START_STICKY
             }
         }
 
@@ -108,30 +128,64 @@ class NodeService : Service() {
     /** Returns `true` if the Node.js process is alive. */
     fun isServerRunning(): Boolean = processManager.isRunning()
 
+    /** Current lifecycle state — query this immediately after binding to avoid missed callbacks. */
+    fun getState(): ServerState = currentState
+
+    /** The exact reason the server failed, if [getState] is [ServerState.FAILED]. */
+    fun getLastError(): String? = lastErrorMessage
+
+    /** Recent server lifecycle/output lines for the diagnostics screen. Never empty after a failed start. */
+    fun getRecentOutput(): List<String> = processManager.getRecentOutput()
+
+    /** Number of automatic restarts attempted so far in the current session. */
+    fun getRestartCount(): Int = restartCount
+
     // -- Internal --
+
+    private fun setState(state: ServerState) {
+        currentState = state
+        onStateChanged?.invoke(state)
+    }
 
     /**
      * Launches the server on the IO dispatcher and waits for it to become ready.
      * Notifies [onServerReady] on success or [onServerError] on failure/timeout.
+     *
+     * [currentState] and [lastErrorMessage] are updated BEFORE invoking callbacks,
+     * so [getState]/[getLastError] are always correct even if the callback itself
+     * is null (not yet assigned) when this runs.
      */
     private fun launchServer() {
+        setState(ServerState.STARTING)
         serviceScope.launch(Dispatchers.IO) {
             val started = processManager.startServer()
             if (!started) {
-                Logger.e(tag, "Failed to start server process")
-                onServerError?.invoke(getString(R.string.error_server_start))
+                // Use the PRECISE reason from ProcessManager (e.g. exact libnode.so
+                // size + actionable fix) instead of a generic string resource.
+                val reason = processManager.getLastFailureReason()
+                    ?: getString(R.string.error_server_start)
+                Logger.e(tag, "Failed to start server process: $reason")
+                lastErrorMessage = reason
+                setState(ServerState.FAILED)
+                onServerError?.invoke(reason)
                 return@launch
             }
 
+            setState(ServerState.WAITING_FOR_HEALTH)
             val ready = processManager.waitForReady()
             if (ready) {
-                // Recovery succeeded; future crashes should get a fresh retry budget.
                 restartCount = 0
-                Logger.i(tag, "Server is ready on port ${processManager.port}")
-                onServerReady?.invoke(processManager.port)
+                readyPort = processManager.port
+                Logger.i(tag, "Server is ready on port $readyPort")
+                setState(ServerState.READY)
+                onServerReady?.invoke(readyPort)
             } else {
-                Logger.e(tag, "Server timeout")
-                onServerError?.invoke(getString(R.string.error_server_timeout))
+                val reason = processManager.getLastFailureReason()
+                    ?: getString(R.string.error_server_timeout)
+                Logger.e(tag, "Server timeout: $reason")
+                lastErrorMessage = reason
+                setState(ServerState.FAILED)
+                onServerError?.invoke(reason)
             }
         }
     }
@@ -145,6 +199,7 @@ class NodeService : Service() {
             Logger.w(tag, "Server crashed (exit=$exitCode), restart #${restartCount + 1}")
             if (isServiceRunning && restartCount < MAX_RESTARTS) {
                 restartCount++
+                setState(ServerState.STARTING)
                 serviceScope.launch(Dispatchers.IO) {
                     val backoffShift = (restartCount - 1).coerceAtMost(MAX_BACKOFF_SHIFT)
                     val delayMs = RESTART_DELAY_MS * (1L shl backoffShift)
@@ -152,8 +207,11 @@ class NodeService : Service() {
                     launchServer()
                 }
             } else {
-                Logger.e(tag, "Max restarts exceeded ($MAX_RESTARTS)")
-                onServerError?.invoke("Server crashed repeatedly. Please restart the app.")
+                val reason = "Server crashed repeatedly (exit=$exitCode) after $MAX_RESTARTS restart attempts."
+                Logger.e(tag, reason)
+                lastErrorMessage = reason
+                setState(ServerState.FAILED)
+                onServerError?.invoke(reason)
             }
         }
     }
@@ -194,6 +252,9 @@ class NodeService : Service() {
     companion object {
         /** Intent action to gracefully stop the server and this service. */
         const val ACTION_STOP = "com.vscodroid.action.STOP_SERVER"
+
+        /** Intent action to force a fresh start attempt, bypassing the isServiceRunning guard. */
+        const val ACTION_RETRY = "com.vscodroid.action.RETRY_SERVER"
 
         /** Maximum number of automatic restart attempts before giving up. */
         private const val MAX_RESTARTS = 5
