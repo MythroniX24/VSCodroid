@@ -139,8 +139,48 @@ echo "  Fixed os.js: updated /tmp fallback to $VSCODROID_PREFIX/tmp"
 
 # Configure
 echo "Configuring..."
-export CC="$NDK_TOOLCHAIN/bin/aarch64-linux-android28-clang"
-export CXX="$NDK_TOOLCHAIN/bin/aarch64-linux-android28-clang++"
+
+# NDK per-API clang wrapper scripts (aarch64-linux-android<NN>-clang) are not
+# guaranteed to exist for every API number in every NDK release — the exact
+# set varies between NDK versions. Hardcoding "28" broke when this stopped
+# being true for this NDK build. Probe for a working pair instead of assuming
+# one specific number, and fall back to the NDK's underlying unified clang
+# binary with an explicit --target= flag (the same mechanism the wrapper
+# scripts use internally, and guaranteed present in every NDK release since r23).
+ANDROID_API=""
+for api in 28 29 30 31 26 27 24 21; do
+    if [ -x "$NDK_TOOLCHAIN/bin/aarch64-linux-android${api}-clang" ] && \
+       [ -x "$NDK_TOOLCHAIN/bin/aarch64-linux-android${api}-clang++" ]; then
+        ANDROID_API="$api"
+        break
+    fi
+done
+
+if [ -n "$ANDROID_API" ]; then
+    echo "Using NDK wrapper scripts for API level $ANDROID_API"
+    export CC="$NDK_TOOLCHAIN/bin/aarch64-linux-android${ANDROID_API}-clang"
+    export CXX="$NDK_TOOLCHAIN/bin/aarch64-linux-android${ANDROID_API}-clang++"
+else
+    echo "No per-API wrapper script found for any candidate API level."
+    echo "Falling back to the unified clang binary with --target= (NDK r23+ convention)."
+    ANDROID_API=28
+    export CC="$NDK_TOOLCHAIN/bin/clang --target=aarch64-linux-android${ANDROID_API}"
+    export CXX="$NDK_TOOLCHAIN/bin/clang++ --target=aarch64-linux-android${ANDROID_API}"
+fi
+
+# Some GYP-generated Makefiles (notably newer deps like deps/base64 and
+# deps/ada) reference the dotted "CC.target" / "CXX.target" Make variables
+# directly instead of inheriting the plain CC/CXX environment variables.
+# Passing both forms as explicit `make` arguments (below) covers whichever
+# convention a given target's generated .target.mk actually uses.
+export CC_target="$CC"
+export CXX_target="$CXX"
+export AR_target="$NDK_TOOLCHAIN/bin/llvm-ar"
+export LINK_target="$CXX"
+
+echo "CC:  $CC"
+echo "CXX: $CXX"
+
 export CC_host="gcc"
 export CXX_host="g++"
 export CFLAGS="-D__TERMUX__ -D__VSCODROID__"
@@ -164,7 +204,33 @@ export GYP_DEFINES="target_arch=arm64 v8_target_arch=arm64 android_target_arch=a
 
 # Build
 echo "Building (this takes 20-60 minutes)..."
-make -j"$(nproc)"
+echo "Disk space before build:"
+df -h . 2>/dev/null || true
+
+# GYP-generated Makefiles for some targets (e.g. deps/base64, deps/ada) use
+# the dotted CC.target / CXX.target / AR.target variable names. Pass them as
+# explicit `make` command-line overrides — these always win over a Makefile's
+# own internal defaults, regardless of which convention any given target uses.
+MAKE_ARGS=(
+    "CC.target=$CC"
+    "CXX.target=$CXX"
+    "AR.target=$NDK_TOOLCHAIN/bin/llvm-ar"
+    "LINK.target=$CXX"
+)
+
+set +e
+make -j"$(nproc)" "${MAKE_ARGS[@]}"
+BUILD_STATUS=$?
+set -e
+
+if [ "$BUILD_STATUS" -ne 0 ]; then
+    echo ""
+    echo "Parallel build failed (exit $BUILD_STATUS). Retrying single-threaded"
+    echo "to rule out a parallel-build race condition before giving up..."
+    echo "Disk space at retry:"
+    df -h . 2>/dev/null || true
+    make -j1 "${MAKE_ARGS[@]}"
+fi
 
 # Strip
 echo "Stripping binary..."
