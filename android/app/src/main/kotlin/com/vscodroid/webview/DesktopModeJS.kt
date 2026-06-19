@@ -10,104 +10,42 @@ package com.vscodroid.webview
  */
 object DesktopModeJS {
 
-    /**
-     * Overrides window.matchMedia so VS Code's startup detection sees desktop values.
-     *
-     * VS Code checks at startup:
-     *   (pointer: coarse) → true  = mobile touch UI
-     *   (hover: none)     → true  = no hover events
-     *   (pointer: fine)   → false = no mouse
-     *
-     * We flip all of these to desktop values.
-     *
-     * SAFETY: Everything wrapped in try-catch. navigator.maxTouchPoints deliberately
-     * NOT overridden — redefining navigator properties throws on many WebView versions.
-     */
-    val MATCH_MEDIA_OVERRIDE = """
-(function() {
-    try {
-        if (window.__vscodroidMatchMediaPatched) return;
-        window.__vscodroidMatchMediaPatched = true;
-
-        var _orig = window.matchMedia ? window.matchMedia.bind(window) : null;
-        if (!_orig) return;
-
-        var _overrides = {
-            '(pointer: coarse)':  false,
-            '(pointer: fine)':    true,
-            '(hover: none)':      false,
-            '(hover: hover)':     true,
-            '(any-pointer: coarse)': false,
-            '(any-hover: none)':  false,
-            '(prefers-color-scheme: dark)':  true,
-            '(prefers-color-scheme: light)': false
-        };
-
-        function fakeResult(query, matches) {
-            var listeners = [];
-            var obj = {
-                matches: matches,
-                media: query,
-                onchange: null,
-                addListener:    function(fn) { listeners.push(fn); },
-                removeListener: function(fn) { var i=listeners.indexOf(fn); if(i>=0) listeners.splice(i,1); },
-                addEventListener: function(t,fn) { if(t==='change') listeners.push(fn); },
-                removeEventListener: function(t,fn) { if(t==='change'){ var i=listeners.indexOf(fn); if(i>=0)listeners.splice(i,1);} },
-                dispatchEvent: function() { return true; }
-            };
-            return obj;
-        }
-
-        window.matchMedia = function(query) {
-            try {
-                var q = (query||'').trim().toLowerCase();
-                if (q in _overrides) return fakeResult(query, _overrides[q]);
-            } catch(e) {}
-            return _orig(query);
-        };
-    } catch(e) {
-        /* matchMedia override failed silently — VS Code still works, just in mobile mode */
-    }
-})();
-""".trimIndent()
+    // NOTE: An earlier version of this object included MATCH_MEDIA_OVERRIDE
+    // (spoofing matchMedia(pointer:coarse)/(hover:none)) and DESKTOP_CSS
+    // (forcing fixed-pixel sizes on VS Code's activity bar/tabs/status bar
+    // via !important rules). Both were removed after direct evidence: loading
+    // the same VS Code server URL in stock Chrome — with NO such overrides —
+    // already renders the correct, fully-proportioned desktop 3-pane layout.
+    // That means VS Code's own responsive CSS activates the desktop layout
+    // purely from viewport WIDTH (which VSCodroidWebView.configure's wide-
+    // viewport setting already provides), not from matchMedia or UA sniffing.
+    // The removed overrides were therefore unnecessary at best, and at worst
+    // were fighting VS Code's own layout calculations — forcing fixed pixel
+    // sizes onto a page that the WebView was *also* independently scaling via
+    // loadWithOverviewMode, producing compounding/incorrect proportions. See
+    // VSCodroidWebView.kt's class doc for the full reasoning.
 
     /**
-     * Injects CSS that enforces desktop VS Code proportions.
-     * Applied after the page loads so VS Code's own CSS is already present.
-     * All rules use !important to override VS Code's responsive overrides.
-     *
-     * SAFETY: Wrapped in try-catch. A CSS injection failure is cosmetic only.
+     * Adds padding for display cutouts/notches only — does NOT set any fixed
+     * pixel sizes on VS Code's own UI elements. This is intentionally narrow
+     * in scope (unlike the removed DESKTOP_CSS) so it cannot fight VS Code's
+     * own layout calculations: it only reserves space at the very edges of
+     * the screen for the activity bar / status bar / sidebar so they aren't
+     * obscured by a notch or rounded corner.
      */
-    val DESKTOP_CSS = """
+    val SAFE_AREA_CSS = """
 (function() {
     try {
-        if (document.getElementById('vscodroid-desktop-css')) return;
+        if (document.getElementById('vscodroid-safe-area-css')) return;
         var s = document.createElement('style');
-        s.id = 'vscodroid-desktop-css';
+        s.id = 'vscodroid-safe-area-css';
         s.textContent = [
-            /* Activity Bar — desktop 48px width */
-            '.part.activitybar{width:48px!important;min-width:48px!important}',
-            '.activitybar .action-item{height:48px!important;width:48px!important}',
-            /* Editor tabs — desktop 35px height */
-            '.tabs-container{height:35px!important}',
-            '.tabs-container .tab{height:35px!important;min-height:35px!important}',
-            /* Status bar — desktop 22px */
-            '.part.statusbar{height:22px!important}',
-            '.statusbar-item{height:22px!important;line-height:22px!important}',
-            /* Explorer rows — desktop 22px */
-            '.monaco-list-row{height:22px!important;min-height:22px!important}',
-            /* Context menus — desktop size (not enlarged for touch) */
-            '.monaco-menu .action-menu-item{height:26px!important}',
-            '.monaco-menu .action-label{padding:0 8px!important;font-size:13px!important}',
-            /* Keep scrollbars visible */
-            '.monaco-scrollable-element>.scrollbar{opacity:0.5!important}',
-            '.monaco-scrollable-element>.scrollbar:hover{opacity:1!important}',
-            /* Safe area insets for notched devices */
-            '.part.statusbar{padding-bottom:env(safe-area-inset-bottom,0px)}',
             '.part.activitybar{padding-left:env(safe-area-inset-left,0px)}',
+            '.part.statusbar{padding-left:env(safe-area-inset-left,0px);padding-right:env(safe-area-inset-right,0px);padding-bottom:env(safe-area-inset-bottom,0px)}',
+            '.part.sidebar{padding-left:env(safe-area-inset-left,0px)}'
         ].join('');
         document.head.appendChild(s);
-    } catch(e) { /* CSS injection failed — cosmetic only */ }
+    } catch(e) { /* cosmetic only */ }
 })();
 """.trimIndent()
 
