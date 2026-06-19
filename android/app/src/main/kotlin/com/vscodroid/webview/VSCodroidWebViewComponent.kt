@@ -7,29 +7,37 @@ import android.os.Looper
 import android.util.AttributeSet
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
-import android.view.ScaleGestureDetector
 import android.webkit.WebView
 import com.vscodroid.util.Logger
 import kotlin.math.abs
-import kotlin.math.ln
 
 /**
- * Custom [WebView] subclass that adds desktop-class input handling:
+ * Custom [WebView] subclass that adds one piece of desktop-class input handling
+ * on top of [VSCodroidWebView]'s configuration: **long press → contextmenu**.
  *
- * 1. **Long press → contextmenu**: A long press (≥550ms without movement) fires a
- *    synthetic `contextmenu` event at the touch coordinates, replicating desktop
- *    right-click. Haptic feedback confirms the action.
+ * A long press (≥550ms without movement) fires a synthetic `contextmenu` event
+ * at the touch coordinates, replicating desktop right-click. Haptic feedback
+ * confirms the action.
  *
- * 2. **Pinch-to-zoom**: A [ScaleGestureDetector] translates two-finger pinch gestures
- *    into VS Code's `editor.action.zoomIn/Out` commands via the WebView bridge.
- *    The native WebView zoom is kept *disabled* so VS Code's own font-size zoom
- *    applies (avoids double-zoom with native scaling artifacts).
+ * ── Pinch-to-zoom ─────────────────────────────────────────────────────────────
+ * Deliberately NOT handled here. [VSCodroidWebView.configure] enables the
+ * WebView's own native pinch-to-zoom (`setSupportZoom`/`builtInZoomControls`),
+ * which scales the entire rendered page — exactly matching how stock Chrome
+ * renders this same VS Code server (proven by direct comparison: the same URL
+ * in Chrome shows the correct, fully-proportioned desktop 3-pane layout shrunk
+ * to fit the screen, with pinch-zoom available to zoom in).
  *
- * 3. **Touch coordinate tracking**: Coordinates of every touch DOWN are recorded
- *    for use by the long-press contextmenu injection.
+ * An earlier version of this class intercepted two-finger gestures with a
+ * [android.view.ScaleGestureDetector] and translated them into a synthetic
+ * Ctrl+=/Ctrl- keystroke aimed at changing VS Code's *editor font size* only.
+ * That fought against native zoom in two ways: it consumed the pinch gesture
+ * before the WebView's own zoom handling could see it, and even when it fired,
+ * it only resized editor text — leaving the activity bar, explorer, tabs, and
+ * status bar permanently tiny with no way to zoom into them. Removing it and
+ * relying on native zoom instead is what makes pinch-zoom actually scale the
+ * whole UI, matching the Chrome reference rendering.
  *
  * Used in [activity_main.xml] as `com.vscodroid.webview.VSCodroidWebViewComponent`.
- * All [VSCodroidWebView.configure] settings are applied externally at setup time.
  */
 @SuppressLint("ClickableViewAccessibility", "ViewConstructor")
 class VSCodroidWebViewComponent @JvmOverloads constructor(
@@ -45,20 +53,15 @@ class VSCodroidWebViewComponent @JvmOverloads constructor(
     private var longPressX = 0f
     private var longPressY = 0f
     private var isLongPressFired = false
-    private var isTwoFingerGesture = false
-
-    // -- Pinch zoom state --
-    private var cumulativeScale = 1.0f
-    private val scaleGestureDetector = ScaleGestureDetector(context, ScaleListener())
+    private var isMultiTouch = false
 
     // Threshold: if touch moves more than this (dp) during a down event, cancel long press
     private val moveCancelThresholdPx: Float by lazy {
         MOVE_CANCEL_THRESHOLD_DP * resources.displayMetrics.density
     }
 
-    // -- Long press runnable --
     private val longPressRunnable = Runnable {
-        if (!isTwoFingerGesture) {
+        if (!isMultiTouch) {
             isLongPressFired = true
             fireContextMenuAt(longPressX, longPressY)
             performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
@@ -67,28 +70,28 @@ class VSCodroidWebViewComponent @JvmOverloads constructor(
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        // Let ScaleGestureDetector inspect ALL events for pinch detection
-        scaleGestureDetector.onTouchEvent(event)
-
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 longPressX = event.x
                 longPressY = event.y
                 isLongPressFired = false
-                isTwoFingerGesture = false
-                // Schedule long press — cancelled on move or lift
+                isMultiTouch = false
                 longPressHandler.removeCallbacks(longPressRunnable)
                 longPressHandler.postDelayed(longPressRunnable, LONG_PRESS_TIMEOUT_MS)
             }
 
             MotionEvent.ACTION_POINTER_DOWN -> {
-                // Two fingers detected — cancel pending long press
-                isTwoFingerGesture = true
+                // A second finger landed — this is a pinch/multi-touch gesture,
+                // not a long-press-for-context-menu. Cancel the pending long
+                // press and let the event fall through to super.onTouchEvent()
+                // UNTOUCHED so the WebView's own native pinch-zoom handling
+                // (enabled in VSCodroidWebView.configure) receives it normally.
+                isMultiTouch = true
                 longPressHandler.removeCallbacks(longPressRunnable)
             }
 
             MotionEvent.ACTION_MOVE -> {
-                if (!isTwoFingerGesture && event.pointerCount == 1) {
+                if (!isMultiTouch && event.pointerCount == 1) {
                     val dx = abs(event.x - longPressX)
                     val dy = abs(event.y - longPressY)
                     if (dx > moveCancelThresholdPx || dy > moveCancelThresholdPx) {
@@ -127,7 +130,6 @@ class VSCodroidWebViewComponent @JvmOverloads constructor(
      * injected before this is called (done in [MainActivity.injectBridgeToken]).
      */
     fun fireContextMenuAt(rawX: Float, rawY: Float) {
-        // Adjust for WebView scroll position
         val scrolledX = rawX + scrollX
         val scrolledY = rawY + scrollY
         evaluateJavascript(
@@ -137,84 +139,11 @@ class VSCodroidWebViewComponent @JvmOverloads constructor(
         )
     }
 
-    // -- Pinch zoom --
-
-    /**
-     * ScaleGestureDetector listener that translates two-finger pinch into
-     * VS Code editor zoom commands.
-     *
-     * Strategy: Accumulate the natural log of the scale factor. When the
-     * accumulated value exceeds ±[ZOOM_STEP_THRESHOLD], fire a zoom command
-     * and reset the accumulator. This produces a stepped zoom that matches
-     * VS Code's font-size zoom (each step = ±1 font size).
-     */
-    private inner class ScaleListener : ScaleGestureDetector.SimpleOnScaleGestureListener() {
-
-        override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
-            cumulativeScale = 1.0f
-            return true
-        }
-
-        override fun onScale(detector: ScaleGestureDetector): Boolean {
-            cumulativeScale *= detector.scaleFactor
-
-            // Use log scale: each factor-of-1.1 triggers a zoom step
-            val logAccum = ln(cumulativeScale.toDouble())
-
-            when {
-                logAccum > ZOOM_STEP_THRESHOLD -> {
-                    fireVSCodeZoomIn()
-                    cumulativeScale = 1.0f
-                }
-                logAccum < -ZOOM_STEP_THRESHOLD -> {
-                    fireVSCodeZoomOut()
-                    cumulativeScale = 1.0f
-                }
-            }
-            return true
-        }
-    }
-
-    private fun fireVSCodeZoomIn() {
-        evaluateJavascript(
-            """(function(){
-                try {
-                    var cs = window.require('vs/platform/commands/common/commands');
-                    if (cs && cs.CommandsRegistry) {
-                        var svc = window.require('vs/platform/instantiation/common/instantiation').IInstantiationService;
-                    }
-                } catch(e) {}
-                // Fallback: dispatch Ctrl+= keyboard event
-                var init = {bubbles:true,cancelable:true,key:'+',code:'Equal',keyCode:187,ctrlKey:true,composed:true};
-                document.activeElement.dispatchEvent(new KeyboardEvent('keydown',init));
-                document.activeElement.dispatchEvent(new KeyboardEvent('keyup',init));
-            })();""",
-            null
-        )
-        Logger.d(tag, "Zoom in via pinch")
-    }
-
-    private fun fireVSCodeZoomOut() {
-        evaluateJavascript(
-            """(function(){
-                var init = {bubbles:true,cancelable:true,key:'-',code:'Minus',keyCode:189,ctrlKey:true,composed:true};
-                var target = document.activeElement || document.body;
-                target.dispatchEvent(new KeyboardEvent('keydown',init));
-                target.dispatchEvent(new KeyboardEvent('keyup',init));
-            })();""",
-            null
-        )
-        Logger.d(tag, "Zoom out via pinch")
-    }
-
     companion object {
         /** Minimum hold time (ms) before long-press fires. */
         private const val LONG_PRESS_TIMEOUT_MS = 550L
 
         /** Movement tolerance in dp before long-press is cancelled. */
         private const val MOVE_CANCEL_THRESHOLD_DP = 8f
-
-        /** Log-scale accumulator threshold before a zoom step fires (~10% scale change). */
-        private const val ZOOM_STEP_THRESHOLD = 0.095
     }
 }
