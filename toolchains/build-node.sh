@@ -12,9 +12,30 @@ VSCODROID_PREFIX="/data/data/com.vscodroid/files/usr"
 
 echo "=== Building Node.js $NODE_VERSION for ARM64 Android ==="
 
-# Check if running in Docker or has NDK
-if [ -z "${ANDROID_NDK_HOME:-}" ]; then
-    echo "ANDROID_NDK_HOME not set. Building in Docker..."
+# ── Docker detection ──────────────────────────────────────────────────────────
+# We MUST run inside the Docker image built from toolchains/Dockerfile — it has
+# a known-good Android NDK r27c at /opt/android-ndk plus the exact host build
+# tools this cross-compile needs.
+#
+# Checking "is ANDROID_NDK_HOME set?" to decide this is UNRELIABLE and was the
+# actual root cause of every "clang++: No such file or directory" failure seen
+# so far: GitHub-hosted Actions runners (ubuntu-latest) come with their OWN
+# Android SDK/NDK pre-installed and ANDROID_NDK_HOME already pointing at it
+# (e.g. /usr/local/lib/android/sdk/ndk/<version>) as part of the default runner
+# image — nothing to do with this script or Docker at all. With the old check,
+# that pre-set variable made the script believe it was "already configured"
+# and skip Docker entirely, silently compiling against the runner's own
+# possibly-incomplete/incompatible NDK installation instead.
+#
+# VSCODROID_DOCKER_BUILD=1 is set ONLY inside our own Dockerfile (see
+# toolchains/Dockerfile) and cannot be true on a bare host runner, so it is
+# the one unambiguous signal that we are actually inside the right container.
+if [ "${VSCODROID_DOCKER_BUILD:-0}" != "1" ]; then
+    echo "Not running inside the VSCodroid build container — launching Docker..."
+    if [ -n "${ANDROID_NDK_HOME:-}" ]; then
+        echo "(Note: ANDROID_NDK_HOME=$ANDROID_NDK_HOME is set on this host, but it is"
+        echo " ignored — Docker provides its own known-good NDK r27c at /opt/android-ndk.)"
+    fi
     docker build --platform linux/amd64 -t vscodroid/build-env "$SCRIPT_DIR"
     docker run --rm --platform linux/amd64 \
         -v "$ROOT_DIR:/workspace" \
@@ -22,6 +43,8 @@ if [ -z "${ANDROID_NDK_HOME:-}" ]; then
         /workspace/toolchains/build-node.sh
     exit $?
 fi
+
+echo "Confirmed running inside the VSCodroid Docker build container."
 
 NDK_HOST_TAG="$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)"
 NDK_TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$NDK_HOST_TAG"
