@@ -43,6 +43,18 @@ ENV LD=$NDK_TOOLCHAIN/bin/ld.lld
 
 ENV PATH=$NDK_TOOLCHAIN/bin:$PATH
 
+# Unambiguous marker that build-node.sh checks to confirm it is actually
+# running inside THIS container, with ITS OWN known-good NDK r27c at
+# /opt/android-ndk. GitHub-hosted Actions runners pre-set ANDROID_NDK_HOME
+# to their own bundled Android SDK/NDK (e.g.
+# /usr/local/lib/android/sdk/ndk/<version>) as part of the default runner
+# image — completely unrelated to this container. Checking only whether
+# ANDROID_NDK_HOME is "set" is not a reliable way to detect "are we inside
+# this Docker image", because that variable is already non-empty on the bare
+# host runner. This marker is the one thing that can only be true inside a
+# container built from this exact Dockerfile.
+ENV VSCODROID_DOCKER_BUILD=1
+
 WORKDIR /build
 
 CMD ["/bin/bash"]
