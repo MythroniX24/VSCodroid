@@ -8,22 +8,39 @@ import com.vscodroid.util.Logger
 /**
  * Configures a [WebView] for hosting VS Code web workbench.
  *
- * KEY DECISIONS:
+ * ── Why this configuration ───────────────────────────────────────────────────
+ * Evidence: loading the exact same VS Code server URL in stock Chrome (no UA
+ * spoofing, no injected CSS, no matchMedia overrides) renders the correct,
+ * fully-proportioned desktop 3-pane VS Code layout — narrow Activity Bar,
+ * properly-sized Explorer, editor, and side panel — just zoomed out to fit the
+ * screen, with native pinch-to-zoom available to zoom back in. That is Chrome's
+ * standard behaviour for any page that doesn't ship a mobile-optimised
+ * `<meta name="viewport">` tag: treat it as a "desktop site", lay it out at a
+ * wide virtual viewport (so CSS breakpoints see desktop width), shrink the
+ * whole rendered page to fit the screen, and let the user pinch-zoom into it.
  *
- * 1. User-agent: We strip " Mobile" from the stock Android WebView UA instead
- *    of replacing it with a desktop UA entirely. This is important because:
- *    - Removing "Mobile" stops VS Code's `isMobile` check from triggering
- *    - Keeping the rest of the Android/Chrome UA ensures VS Code doesn't serve
- *      unexpected content or hit platform-detection code paths that crash WebView
- *    - A full Linux desktop UA caused VS Code to fail initialization (white screen)
- *
- * 2. loadWithOverviewMode: kept TRUE. Setting it to false with useWideViewPort=true
- *    causes the page to render at native resolution before VS Code's CSS loads,
- *    producing a white flash that stays white if any JS error occurs.
- *
- * 3. setSupportMultipleWindows: FALSE. VS Code's internal webview panels use iframes,
- *    not window.open(). Enabling multiple windows changes iframe routing in ways
- *    that break VS Code's extension panel rendering.
+ * This WebView is configured to reproduce exactly that proven-working
+ * behaviour — nothing more:
+ *  • useWideViewPort + loadWithOverviewMode  → same "wide virtual viewport,
+ *    shrink to fit" handling Chrome uses by default for non-mobile pages.
+ *  • Native pinch-zoom ENABLED (setSupportZoom/builtInZoomControls = true)
+ *    → the same interaction model Chrome offers, letting the user zoom into
+ *    the correctly-proportioned desktop layout. A previous version of this
+ *    class disabled native zoom and substituted a custom two-finger gesture
+ *    that only changed VS Code's editor font size (via a synthetic Ctrl+/Ctrl-
+ *    keystroke) — that left the *rest* of the UI (activity bar, explorer,
+ *    tabs, status bar) permanently tiny with no way to zoom into it, which is
+ *    what made the in-app layout look broken compared to Chrome.
+ *  • No custom CSS overrides, no matchMedia spoofing. VS Code's own responsive
+ *    layout already renders correctly once it sees a desktop-width viewport
+ *    (proven by the Chrome screenshot); forcing additional CSS on top of that
+ *    fights VS Code's own layout calculations instead of helping.
+ *  • UA: only the literal substring " Mobile" is stripped (Android/Chrome
+ *    otherwise left intact). This is a narrow, low-risk tweak for any
+ *    UA-string-based (not viewport-based) `isMobile` branches VS Code may use
+ *    elsewhere — it is NOT what makes the desktop layout activate (the wide
+ *    viewport already does that, per the Chrome evidence), so it is safe to
+ *    keep without needing to fully spoof a desktop OS in the UA.
  */
 object VSCodroidWebView {
     private const val TAG = "VSCodroidWebView"
@@ -31,16 +48,12 @@ object VSCodroidWebView {
     @SuppressLint("SetJavaScriptEnabled")
     fun configure(webView: WebView) {
         // ── User Agent: strip "Mobile" only ─────────────────────────────────
-        // Original UA example: "Mozilla/5.0 (Linux; Android 14; SM-G998B) AppleWebKit/537.36
-        //   (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
-        // After strip:        "Mozilla/5.0 (Linux; Android 14; SM-G998B) AppleWebKit/537.36
-        //   (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        //
-        // VS Code checks: userAgent.indexOf('Mobile') >= 0  → must be -1 for desktop mode
+        // "Mozilla/5.0 (Linux; Android 14; SM-G998B) ... Chrome/131.0.0.0 Mobile Safari/537.36"
+        //                                          → ... Chrome/131.0.0.0 Safari/537.36
         val originalUA = webView.settings.userAgentString ?: ""
         val desktopUA  = originalUA
-            .replace(" Mobile Safari/", " Safari/")   // removes "Mobile" from UA string
-            .replace(" Mobile/", "/")                  // catch alternate formats
+            .replace(" Mobile Safari/", " Safari/")
+            .replace(" Mobile/", "/")
         webView.settings.userAgentString = desktopUA
         Logger.i(TAG, "UA: $desktopUA")
 
@@ -50,21 +63,48 @@ object VSCodroidWebView {
             domStorageEnabled  = true
             @Suppress("DEPRECATION") databaseEnabled = true
 
-            // ── Viewport ─────────────────────────────────────────────────────
-            // useWideViewPort=true  → honour <meta name="viewport">
-            // loadWithOverviewMode=true → fit to screen initially (prevents white flash
-            //   before VS Code's CSS loads)
+            // ── Viewport: reproduce Chrome's default "desktop site" handling ──
+            // useWideViewPort=true       → if no mobile viewport meta tag is
+            //                              present, use a wide virtual viewport
+            //                              (same mechanism Chrome uses) so VS
+            //                              Code's CSS sees desktop-class width.
+            // loadWithOverviewMode=true  → initially zoom out to fit that wide
+            //                              layout onto the physical screen,
+            //                              exactly like Chrome's "desktop site
+            //                              shrunk to fit" rendering.
             useWideViewPort      = true
             loadWithOverviewMode = true
 
-            // ── Zoom ─────────────────────────────────────────────────────────
-            // Disable native WebView zoom; VSCodroidWebViewComponent handles
-            // pinch-to-zoom by injecting Ctrl+=/Ctrl+- into VS Code instead.
-            setSupportZoom(false)
-            builtInZoomControls  = false
-            displayZoomControls  = false
+            // ── Zoom: NATIVE pinch-to-zoom enabled ────────────────────────────
+            // This is what actually makes the shrunk-to-fit desktop layout
+            // usable — exactly mirroring Chrome's interaction model. The on-
+            // screen +/- zoom buttons are hidden (displayZoomControls=false)
+            // since pinch gesture alone is the natural touch interaction; the
+            // buttons would just clutter the UI.
+            setSupportZoom(true)
+            builtInZoomControls = true
+            displayZoomControls = false
 
-            // Text zoom: lock at 100% so system font-scale can't distort editor layout
+            // Disable Android's legacy text-autosizing layout algorithm.
+            // TEXT_AUTOSIZING inflates font sizes heuristically to "improve
+            // readability" on narrow columns — directly conflicting with VS
+            // Code's own precisely-sized 11-13px UI text and is a classic
+            // cause of embedded-WebView layouts looking visually different
+            // from the same page in stock Chrome (which does not do this for
+            // desktop-site-rendered pages). NORMAL disables that heuristic.
+            @Suppress("DEPRECATION")
+            layoutAlgorithm = WebSettings.LayoutAlgorithm.NORMAL
+
+            // Do not let Android enforce a minimum font size — VS Code's UI
+            // intentionally uses very small text (11-13px) as part of its
+            // desktop-density layout; an enforced minimum would visually
+            // distort proportions versus the Chrome reference rendering.
+            minimumFontSize        = 1
+            minimumLogicalFontSize = 1
+
+            // Text zoom: 100% — system accessibility font-scale must not
+            // additionally distort VS Code's layout on top of the pinch-zoom
+            // the user controls directly.
             textZoom = 100
 
             // ── Content access ────────────────────────────────────────────────
