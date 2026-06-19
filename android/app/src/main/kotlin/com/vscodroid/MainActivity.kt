@@ -641,34 +641,32 @@ class MainActivity : AppCompatActivity() {
             "window.__vscodroid.authToken='$token';", null
         )
 
-        // 2. matchMedia override — makes VS Code render desktop layout.
-        //    Safe here (onPageFinished): VS Code's workbench re-checks matchMedia
-        //    when the window is resized or when layout recalculates. Our override
-        //    takes effect on the next such check and on any new matchMedia() call.
-        wv.evaluateJavascript(DesktopModeJS.MATCH_MEDIA_OVERRIDE, null)
+        // 2. Safe-area padding for notches/cutouts only (no forced layout sizes —
+        //    see DesktopModeJS.kt's note on why the old matchMedia/CSS overrides
+        //    were removed: VS Code's own desktop layout already activates
+        //    correctly from the wide viewport set in VSCodroidWebView.configure,
+        //    confirmed by comparing against the same URL rendered in Chrome).
+        wv.evaluateJavascript(DesktopModeJS.SAFE_AREA_CSS, null)
 
-        // 3. Desktop CSS — enforce desktop proportions
-        wv.evaluateJavascript(DesktopModeJS.DESKTOP_CSS, null)
-
-        // 4. window.open override — external links open in browser
+        // 3. window.open override — external links open in browser
         wv.evaluateJavascript(DesktopModeJS.WINDOW_OPEN_OVERRIDE, null)
 
-        // 5. Context menu bridge — enables long-press right-click
+        // 4. Context menu bridge — enables long-press right-click
         wv.evaluateJavascript(DesktopModeJS.CONTEXT_MENU_BRIDGE, null)
 
-        // 6. Memory pressure handler
+        // 5. Memory pressure handler
         wv.evaluateJavascript(DesktopModeJS.MEMORY_PRESSURE_HANDLER, null)
 
-        // 7. BroadcastChannel relay for Web Worker → AndroidBridge calls
+        // 6. BroadcastChannel relay for Web Worker → AndroidBridge calls
         wv.evaluateJavascript(DesktopModeJS.BRIDGE_RELAY, null)
 
-        // 8. Command palette commands (runs async retry loop — safe to fire early)
+        // 7. Command palette commands (runs async retry loop — safe to fire early)
         wv.evaluateJavascript(DesktopModeJS.PALETTE_COMMANDS, null)
 
-        // 9. Extra key row modifier interceptor
+        // 8. Extra key row modifier interceptor
         extraKeyRow?.keyInjector?.setupModifierInterceptor()
 
-        // 10. Process any file-open intent from cold start
+        // 9. Process any file-open intent from cold start
         pendingFileUri?.let { uri ->
             pendingFileUri = null
             handleIntent(Intent().apply { data = uri })
