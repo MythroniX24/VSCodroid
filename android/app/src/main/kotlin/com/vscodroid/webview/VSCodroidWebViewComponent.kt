@@ -7,17 +7,27 @@ import android.os.Looper
 import android.util.AttributeSet
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
+import android.view.inputmethod.InputMethodManager
 import android.webkit.WebView
 import com.vscodroid.util.Logger
 import kotlin.math.abs
 
 /**
- * Custom [WebView] subclass that adds one piece of desktop-class input handling
- * on top of [VSCodroidWebView]'s configuration: **long press → contextmenu**.
+ * Custom [WebView] subclass that adds two pieces of desktop-class input handling
+ * on top of [VSCodroidWebView]'s configuration:
  *
- * A long press (≥550ms without movement) fires a synthetic `contextmenu` event
- * at the touch coordinates, replicating desktop right-click. Haptic feedback
- * confirms the action.
+ * 1. **Long press → contextmenu**: a long press (≥550ms without movement) fires
+ *    a synthetic `contextmenu` event at the touch coordinates, replicating
+ *    desktop right-click. Haptic feedback confirms the action.
+ *
+ * 2. **Forced soft-keyboard show on editable tap**: see [checkAndShowKeyboard]
+ *    for the detailed reasoning. Short version: Monaco (VS Code's editor
+ *    component) focuses input via a visually hidden/near-zero-size `<textarea>`
+ *    positioned at the text cursor — a well-known class of element for which
+ *    Android's automatic "should I pop the IME for this focused element?"
+ *    heuristic is unreliable inside an embedded WebView (unlike a full Chrome
+ *    tab). We explicitly detect an editable focus after each tap and force
+ *    the soft keyboard open as a safety net.
  *
  * ── Pinch-to-zoom ─────────────────────────────────────────────────────────────
  * Deliberately NOT handled here. [VSCodroidWebView.configure] enables the
@@ -26,16 +36,6 @@ import kotlin.math.abs
  * renders this same VS Code server (proven by direct comparison: the same URL
  * in Chrome shows the correct, fully-proportioned desktop 3-pane layout shrunk
  * to fit the screen, with pinch-zoom available to zoom in).
- *
- * An earlier version of this class intercepted two-finger gestures with a
- * [android.view.ScaleGestureDetector] and translated them into a synthetic
- * Ctrl+=/Ctrl- keystroke aimed at changing VS Code's *editor font size* only.
- * That fought against native zoom in two ways: it consumed the pinch gesture
- * before the WebView's own zoom handling could see it, and even when it fired,
- * it only resized editor text — leaving the activity bar, explorer, tabs, and
- * status bar permanently tiny with no way to zoom into them. Removing it and
- * relying on native zoom instead is what makes pinch-zoom actually scale the
- * whole UI, matching the Chrome reference rendering.
  *
  * Used in [activity_main.xml] as `com.vscodroid.webview.VSCodroidWebViewComponent`.
  */
@@ -100,15 +100,26 @@ class VSCodroidWebViewComponent @JvmOverloads constructor(
                 }
             }
 
-            MotionEvent.ACTION_UP,
-            MotionEvent.ACTION_CANCEL -> {
+            MotionEvent.ACTION_UP -> {
                 longPressHandler.removeCallbacks(longPressRunnable)
-                // If a long press just fired, suppress the tap-up so VS Code
-                // doesn't also register a click on the context menu location.
                 if (isLongPressFired) {
+                    // Long press just fired its context menu — suppress the
+                    // tap-up so VS Code doesn't ALSO register a click there.
                     isLongPressFired = false
                     return true  // consume the event
                 }
+                if (!isMultiTouch) {
+                    // Normal short tap (not the end of a pinch gesture) — let
+                    // the tap reach the page normally first (super call below),
+                    // then check whether it focused something editable and
+                    // force the soft keyboard if so. See checkAndShowKeyboard().
+                    checkAndShowKeyboard()
+                }
+            }
+
+            MotionEvent.ACTION_CANCEL -> {
+                longPressHandler.removeCallbacks(longPressRunnable)
+                isLongPressFired = false
             }
         }
 
@@ -139,11 +150,85 @@ class VSCodroidWebViewComponent @JvmOverloads constructor(
         )
     }
 
+    // -- Soft keyboard --
+
+    /**
+     * Forces the soft keyboard open if the tap that just landed focused an
+     * editable element — explicitly, rather than relying solely on the
+     * WebView's own automatic "focused input → show IME" behaviour.
+     *
+     * ── Why this is needed ───────────────────────────────────────────────────
+     * VS Code's editor (Monaco) does not use a normal, fully-visible
+     * `<textarea>` for keyboard input. It captures keystrokes through a
+     * `<textarea class="inputarea">` that Monaco deliberately keeps visually
+     * near-invisible (effectively zero-size / fully transparent, repositioned
+     * to track the text cursor) so it never shows a visible text-input box
+     * over the rendered code. This is standard, correct behaviour for Monaco
+     * on a desktop browser with a physical keyboard, where no "should I show
+     * a virtual keyboard" decision is ever needed.
+     *
+     * On Android, *something* has to decide whether to pop the soft keyboard
+     * when a `<textarea>` gains focus, and the heuristics WebView/Chromium use
+     * for that decision are known to be unreliable specifically for inputs
+     * that are near-zero-size or visually hidden — exactly Monaco's case. In
+     * a full Chrome tab the IME can still appear correctly because Chrome's
+     * own focus-handling stack differs slightly from an embedded WebView's;
+     * inside our embedded WebView it can silently fail to show the keyboard
+     * at all, even though focus genuinely moved to the editable element. This
+     * matches the reported symptom precisely: tapping into the editor doesn't
+     * bring up the keyboard.
+     *
+     * ── The fix ──────────────────────────────────────────────────────────────
+     * After every short tap, once the tap has had a moment to land and update
+     * `document.activeElement` (via [super.onTouchEvent] dispatching the real
+     * touch/click first), we query whether the now-focused element is
+     * text-editable (`<textarea>`, `<input>`, or `contenteditable`). If so, we
+     * explicitly call [InputMethodManager.showSoftInput] ourselves — bypassing
+     * whatever unreliable automatic decision the WebView would otherwise make.
+     *
+     * Deliberately scoped to only fire when an editable element is actually
+     * focused (not unconditionally on every tap), so tapping non-text UI like
+     * the Explorer tree, Activity Bar, or Status Bar never spuriously pops the
+     * keyboard.
+     */
+    private fun checkAndShowKeyboard() {
+        postDelayed({
+            evaluateJavascript(ACTIVE_ELEMENT_IS_EDITABLE_JS) { result ->
+                if (result == "true") {
+                    requestFocus()
+                    val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE)
+                        as? InputMethodManager
+                    imm?.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT)
+                    Logger.d(tag, "Forced soft keyboard show (editable element focused)")
+                }
+            }
+        }, KEYBOARD_CHECK_DELAY_MS)
+    }
+
     companion object {
         /** Minimum hold time (ms) before long-press fires. */
         private const val LONG_PRESS_TIMEOUT_MS = 550L
 
         /** Movement tolerance in dp before long-press is cancelled. */
         private const val MOVE_CANCEL_THRESHOLD_DP = 8f
+
+        /**
+         * Delay (ms) after ACTION_UP before checking document.activeElement.
+         * Gives the tap's click/focus DOM events time to land before we query
+         * which element ended up focused.
+         */
+        private const val KEYBOARD_CHECK_DELAY_MS = 120L
+
+        /** Returns "true"/"false" (as a JS boolean) depending on whether the currently focused element accepts text input. */
+        private const val ACTIVE_ELEMENT_IS_EDITABLE_JS = """
+(function(){
+    var el = document.activeElement;
+    if (!el) return false;
+    var tag = el.tagName ? el.tagName.toLowerCase() : '';
+    if (tag === 'textarea' || tag === 'input') return true;
+    if (el.isContentEditable) return true;
+    return false;
+})();
+"""
     }
 }
