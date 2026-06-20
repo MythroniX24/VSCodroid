@@ -229,8 +229,31 @@ class MainActivity : AppCompatActivity() {
     // SAF Folder Picker
     // =====================================================================
 
+    /**
+     * Opens the SAF folder picker.
+     *
+     * Android's `ACTION_OPEN_DOCUMENT_TREE` (which [folderPickerLauncher] wraps)
+     * defaults to opening on the system picker's "Recent" tab when launched with
+     * no starting location — and "Recent" shows individual recently-used FILES,
+     * not a folder tree. This is a well-documented Android UX quirk: the user
+     * sees a flat list of files with no obvious way to select/navigate into a
+     * folder, exactly matching the "files seedha aa rahe hain, folder option
+     * nahi" symptom.
+     *
+     * Fix: pass an initial URI pointing at the root of "Internal Storage" via
+     * [ActivityResultContracts.OpenDocumentTree]'s input parameter (which the
+     * AndroidX contract forwards as `DocumentsContract.EXTRA_INITIAL_URI`).
+     * This lands the picker directly inside a navigable folder tree instead of
+     * the Recent-files tab, so a folder can actually be selected and the
+     * "Use this folder" button is reachable. This is a standard, safe hint —
+     * if a given OEM's file manager can't resolve it, Android silently falls
+     * back to its own default starting location (no crash risk).
+     */
     fun openFolderPicker() {
-        folderPickerLauncher.launch(null)
+        val internalStorageRoot = Uri.parse(
+            "content://com.android.externalstorage.documents/document/primary%3A"
+        )
+        folderPickerLauncher.launch(internalStorageRoot)
     }
 
     fun openVsixPicker() {
