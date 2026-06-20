@@ -45,6 +45,14 @@ import com.vscodroid.util.Logger
 object VSCodroidWebView {
     private const val TAG = "VSCodroidWebView"
 
+    /**
+     * Additional zoom-out applied on top of loadWithOverviewMode's auto-fit,
+     * as a percentage (100 = no extra zoom-out, matches the auto-fit baseline).
+     * Tune this value directly if more/less of the desktop UI should be
+     * visible by default on first load.
+     */
+    private const val INITIAL_SCALE_PERCENT = 80
+
     @SuppressLint("SetJavaScriptEnabled")
     fun configure(webView: WebView) {
         // ── User Agent: strip "Mobile" only ─────────────────────────────────
@@ -133,6 +141,19 @@ object VSCodroidWebView {
 
         // ── Hardware acceleration ─────────────────────────────────────────────
         webView.setLayerType(WebView.LAYER_TYPE_HARDWARE, null)
+
+        // ── Initial zoom level ───────────────────────────────────────────────
+        // loadWithOverviewMode (above) already auto-computes a "fit wide
+        // content to screen" scale on load — the same baseline behaviour
+        // Chrome uses. setInitialScale() applies an ADDITIONAL zoom-out on top
+        // of that baseline so more of the desktop UI (activity bar, full
+        // explorer tree, more editor width) is visible at once on a phone
+        // screen, closer to real desktop VS Code's information density.
+        //
+        // INITIAL_SCALE_PERCENT is a tunable constant — lower it for more
+        // zoomed-out / higher it for less zoomed-out. The user can still pinch
+        // further in or out from this starting point via native zoom.
+        webView.setInitialScale(INITIAL_SCALE_PERCENT)
 
         // ── Scrollbars ────────────────────────────────────────────────────────
         // VS Code renders its own Monaco scrollbars; hide Android's duplicates
