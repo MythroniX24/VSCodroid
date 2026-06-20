@@ -50,6 +50,135 @@ object DesktopModeJS {
 """.trimIndent()
 
     /**
+     * Intercepts VS Code's OWN built-in "Open Folder" action (every way a user
+     * can trigger it) and redirects it to [AndroidBridge.openFolderPicker] —
+     * Android's native SAF folder-tree picker — instead of letting VS Code show
+     * its own dialog.
+     *
+     * ── Why this is needed ───────────────────────────────────────────────────
+     * VSCodroid runs full vscode-reh (server) mode, not the browser-only
+     * vscode.dev. In this mode, VS Code's own built-in "Open Folder" command
+     * (File menu, Ctrl+K Ctrl+O, the welcome-page button, Command Palette)
+     * shows VS Code's OWN dialog browsing the REMOTE filesystem — which here
+     * means the Node.js server process's filesystem, i.e. the app's PRIVATE
+     * Android storage (`/data/data/com.vscodroid/...`), not the phone's real
+     * storage the user actually wants to browse. That dialog never goes
+     * through our [AndroidBridge]/SAF integration at all, which is why it
+     * looked broken/empty/unfamiliar with no real "pick a folder from my
+     * phone" option — a completely different, unrelated code path from our
+     * custom `vscodroid.openFolderPicker` Command Palette entry.
+     *
+     * ── Three independent interception layers ────────────────────────────────
+     * Implemented as three SEPARATE mechanisms (not relying on any single one)
+     * because each covers a different real-world entry point and none alone is
+     * guaranteed reliable across VS Code versions:
+     *
+     * 1. Keydown capture-phase listener for the Ctrl+K, Ctrl+O chord — the
+     *    standard cross-version "Open Folder" keybinding. Captured BEFORE VS
+     *    Code's own keybinding service sees the event (capture phase, on
+     *    `document`), so this is guaranteed to win regardless of VS Code's
+     *    internal command-resolution behaviour.
+     *
+     * 2. Click capture-phase listener for any element whose `href` (or an
+     *    ancestor's `href`) is a `command:` URI containing "openFolder" — this
+     *    is VS Code's standard convention for File-menu items and the
+     *    welcome/empty-Explorer "Open Folder" button. Falls back to matching
+     *    visible button/link TEXT content ("Open Folder") for elements that
+     *    don't expose a `command:` href directly, maximising coverage without
+     *    depending on a specific DOM attribute convention.
+     *
+     * 3. `CommandsRegistry.registerCommand('workbench.action.files.openFolder', ...)`
+     *    override — VS Code's command registry is explicitly designed to allow
+     *    extensions to override built-in commands by registering on the same
+     *    id (this is how formatter/linter extensions routinely override
+     *    built-in actions). Added as defense-in-depth for the Command Palette
+     *    typed-search path specifically, which doesn't go through a clickable
+     *    DOM link the way the menu/welcome-button paths do.
+     */
+    val INTERCEPT_OPEN_FOLDER = """
+(function() {
+    try {
+        if (window.__vscodroidOpenFolderIntercepted) return;
+        window.__vscodroidOpenFolderIntercepted = true;
+
+        function triggerNativeFolderPicker() {
+            var token = (window.__vscodroid || {}).authToken;
+            if (token && typeof AndroidBridge !== 'undefined') {
+                AndroidBridge.openFolderPicker(token);
+                return true;
+            }
+            return false;
+        }
+
+        // Layer 1: Ctrl+K, Ctrl+O keyboard chord
+        var awaitingChordKey = false;
+        var chordTimeout = null;
+        document.addEventListener('keydown', function(e) {
+            try {
+                var key = (e.key || '').toLowerCase();
+                if (e.ctrlKey && !e.shiftKey && !e.altKey && key === 'k') {
+                    awaitingChordKey = true;
+                    clearTimeout(chordTimeout);
+                    chordTimeout = setTimeout(function() { awaitingChordKey = false; }, 1500);
+                    return;
+                }
+                if (awaitingChordKey && e.ctrlKey && !e.shiftKey && !e.altKey && key === 'o') {
+                    awaitingChordKey = false;
+                    clearTimeout(chordTimeout);
+                    if (triggerNativeFolderPicker()) {
+                        e.preventDefault();
+                        e.stopImmediatePropagation();
+                    }
+                    return;
+                }
+                awaitingChordKey = false;
+            } catch(err) {}
+        }, true);
+
+        // Layer 2: click on any "Open Folder" link/button (command: href or text match)
+        document.addEventListener('click', function(e) {
+            try {
+                var el = e.target;
+                for (var depth = 0; el && depth < 6; depth++, el = el.parentElement) {
+                    var href = el.getAttribute && (el.getAttribute('href') || el.getAttribute('data-href'));
+                    if (href && /command:.*openfolder/i.test(href)) {
+                        if (triggerNativeFolderPicker()) {
+                            e.preventDefault();
+                            e.stopImmediatePropagation();
+                        }
+                        return;
+                    }
+                    var text = (el.textContent || '').trim().toLowerCase();
+                    if (text === 'open folder' || text === 'open folder...') {
+                        if (triggerNativeFolderPicker()) {
+                            e.preventDefault();
+                            e.stopImmediatePropagation();
+                        }
+                        return;
+                    }
+                }
+            } catch(err) {}
+        }, true);
+
+        // Layer 3: override the command registry entry (Command Palette path)
+        var attempts = 0;
+        var iv = setInterval(function() {
+            attempts++;
+            if (attempts > 60) { clearInterval(iv); return; }
+            try {
+                var cs = window.require && window.require('vs/platform/commands/common/commands');
+                if (!cs || !cs.CommandsRegistry) return;
+                clearInterval(iv);
+                cs.CommandsRegistry.registerCommand('workbench.action.files.openFolder', function() {
+                    triggerNativeFolderPicker();
+                });
+            } catch(err) { /* retry */ }
+        }, 250);
+    } catch(e) {}
+})();
+""".trimIndent()
+
+    /**
      * Exposes window.__vscodroid.fireContextMenu(x, y) for long-press right-click.
      * Called by VSCodroidWebViewComponent when a long-press is detected.
      */
