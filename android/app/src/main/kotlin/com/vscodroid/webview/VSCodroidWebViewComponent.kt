@@ -163,46 +163,62 @@ class VSCodroidWebViewComponent @JvmOverloads constructor(
      * `<textarea class="inputarea">` that Monaco deliberately keeps visually
      * near-invisible (effectively zero-size / fully transparent, repositioned
      * to track the text cursor) so it never shows a visible text-input box
-     * over the rendered code. This is standard, correct behaviour for Monaco
-     * on a desktop browser with a physical keyboard, where no "should I show
-     * a virtual keyboard" decision is ever needed.
+     * over the rendered code — correct behaviour on desktop with a physical
+     * keyboard, where no "should I show a virtual keyboard" decision exists.
      *
-     * On Android, *something* has to decide whether to pop the soft keyboard
-     * when a `<textarea>` gains focus, and the heuristics WebView/Chromium use
-     * for that decision are known to be unreliable specifically for inputs
-     * that are near-zero-size or visually hidden — exactly Monaco's case. In
-     * a full Chrome tab the IME can still appear correctly because Chrome's
-     * own focus-handling stack differs slightly from an embedded WebView's;
-     * inside our embedded WebView it can silently fail to show the keyboard
-     * at all, even though focus genuinely moved to the editable element. This
-     * matches the reported symptom precisely: tapping into the editor doesn't
-     * bring up the keyboard.
+     * ── Why a plain showSoftInput() call isn't enough ────────────────────────
+     * Android's [InputMethodManager] decides whether/how to show the IME based
+     * on the focused [View]'s current [android.view.inputmethod.InputConnection]
+     * — for a WebView, that connection is established internally by the
+     * Chromium engine's own `ImeAdapter`, tied to whichever DOM element the
+     * PAGE currently considers focused. Simply calling `showSoftInput()` from
+     * OUTSIDE does not guarantee the system has an up-to-date, correctly-bound
+     * InputConnection for Monaco's specific (near-invisible) textarea — the
+     * missing piece in the reported bug isn't "nobody asked for the keyboard",
+     * it's that the system's InputConnection binding for this specific kind of
+     * focused element can go stale or never gets (re-)established at all.
      *
-     * ── The fix ──────────────────────────────────────────────────────────────
-     * After every short tap, once the tap has had a moment to land and update
-     * `document.activeElement` (via [super.onTouchEvent] dispatching the real
-     * touch/click first), we query whether the now-focused element is
-     * text-editable (`<textarea>`, `<input>`, or `contenteditable`). If so, we
-     * explicitly call [InputMethodManager.showSoftInput] ourselves — bypassing
-     * whatever unreliable automatic decision the WebView would otherwise make.
+     * The fix: explicitly call [InputMethodManager.restartInput] FIRST — this
+     * forces Android to re-query [onCreateInputConnection] on the WebView right
+     * now (which Chromium implements correctly once the DOM element genuinely
+     * has focus), establishing a fresh, correctly-bound InputConnection — THEN
+     * call [InputMethodManager.showSoftInput] with the stronger
+     * [InputMethodManager.SHOW_FORCED] flag (rather than `SHOW_IMPLICIT`, which
+     * silently no-ops under several common conditions `SHOW_FORCED` does not).
      *
-     * Deliberately scoped to only fire when an editable element is actually
-     * focused (not unconditionally on every tap), so tapping non-text UI like
-     * the Explorer tree, Activity Bar, or Status Bar never spuriously pops the
-     * keyboard.
+     * A short, two-attempt retry (immediate + [KEYBOARD_RETRY_DELAY_MS] later)
+     * covers the case where Monaco's own internal `.focus()` call on its
+     * textarea happens asynchronously, one tick after the click/tap handler —
+     * the first attempt may run before that focus call has actually landed.
      */
     private fun checkAndShowKeyboard() {
-        postDelayed({
-            evaluateJavascript(ACTIVE_ELEMENT_IS_EDITABLE_JS) { result ->
-                if (result == "true") {
-                    requestFocus()
-                    val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE)
-                        as? InputMethodManager
-                    imm?.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT)
-                    Logger.d(tag, "Forced soft keyboard show (editable element focused)")
-                }
+        postDelayed({ attemptShowKeyboard(retriesLeft = 1) }, KEYBOARD_CHECK_DELAY_MS)
+    }
+
+    private fun attemptShowKeyboard(retriesLeft: Int) {
+        evaluateJavascript(ACTIVE_ELEMENT_IS_EDITABLE_JS) { result ->
+            if (result == "true") {
+                forceShowKeyboard()
+            } else if (retriesLeft > 0) {
+                // Monaco's focus() may land a tick later than our first check —
+                // try once more before giving up.
+                postDelayed({ attemptShowKeyboard(retriesLeft - 1) }, KEYBOARD_RETRY_DELAY_MS)
             }
-        }, KEYBOARD_CHECK_DELAY_MS)
+        }
+    }
+
+    private fun forceShowKeyboard() {
+        requestFocus()
+        val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+        if (imm == null) {
+            Logger.w(tag, "InputMethodManager unavailable")
+            return
+        }
+        // Re-establish a fresh InputConnection binding for the currently
+        // focused DOM element before asking the system to display the IME.
+        imm.restartInput(this)
+        imm.showSoftInput(this, InputMethodManager.SHOW_FORCED)
+        Logger.d(tag, "Forced soft keyboard show (restartInput + SHOW_FORCED)")
     }
 
     companion object {
@@ -218,6 +234,9 @@ class VSCodroidWebViewComponent @JvmOverloads constructor(
          * which element ended up focused.
          */
         private const val KEYBOARD_CHECK_DELAY_MS = 120L
+
+        /** Delay (ms) before the second (retry) activeElement check. */
+        private const val KEYBOARD_RETRY_DELAY_MS = 200L
 
         /** Returns "true"/"false" (as a JS boolean) depending on whether the currently focused element accepts text input. */
         private const val ACTIVE_ELEMENT_IS_EDITABLE_JS = """
