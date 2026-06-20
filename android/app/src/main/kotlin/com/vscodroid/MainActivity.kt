@@ -677,6 +677,11 @@ class MainActivity : AppCompatActivity() {
         // 4. Context menu bridge — enables long-press right-click
         wv.evaluateJavascript(DesktopModeJS.CONTEXT_MENU_BRIDGE, null)
 
+        // 4b. Intercept VS Code's own native "Open Folder" (keybinding, menu
+        //     click, command palette) and redirect to our Android SAF picker —
+        //     see DesktopModeJS.INTERCEPT_OPEN_FOLDER for the full reasoning.
+        wv.evaluateJavascript(DesktopModeJS.INTERCEPT_OPEN_FOLDER, null)
+
         // 5. Memory pressure handler
         wv.evaluateJavascript(DesktopModeJS.MEMORY_PRESSURE_HANDLER, null)
 
