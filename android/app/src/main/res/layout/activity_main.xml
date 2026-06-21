@@ -20,9 +20,9 @@
     <!--
         VSCodroidWebViewComponent adds:
           • Long press (550ms) → contextmenu event (right-click simulation)
-          • Pinch-to-zoom → Ctrl+= / Ctrl+- in VS Code editor
-        All WebView settings applied in VSCodroidWebView.configure() at startup.
-        Background color #1e1e1e set programmatically via setBackgroundColor().
+          • Forced soft-keyboard show on editable tap (Monaco hidden-textarea fix)
+        Native pinch-to-zoom is enabled via WebSettings in VSCodroidWebView.configure().
+        Dark background applied via the android:background attribute below.
     -->
     <com.vscodroid.webview.VSCodroidWebViewComponent
         android:id="@+id/webView"
@@ -40,5 +40,19 @@
         android:layout_height="wrap_content"
         android:layout_gravity="bottom"
         android:visibility="gone" />
+
+    <!--
+        Temporary on-device debug console — a small floating "LOG" toggle that
+        expands into a console showing JS console.log/warn/error output (incl.
+        errors our injected scripts' try/catch blocks would otherwise swallow
+        silently) plus direct Kotlin-side diagnostic lines. Added LAST so it
+        renders on top of everything else; only its own small button/panel
+        consume touches, the WebView underneath is unaffected. Only shown in
+        debuggable builds (gated in MainActivity via Logger.debugEnabled).
+    -->
+    <com.vscodroid.debug.DebugConsoleOverlay
+        android:id="@+id/debugConsole"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
 
 </FrameLayout>
