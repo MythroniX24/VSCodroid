@@ -48,6 +48,13 @@ class VSCodroidWebViewComponent @JvmOverloads constructor(
 
     private val tag = "VSCWebViewComponent"
 
+    /**
+     * Optional sink for diagnostic lines, wired by [MainActivity] to
+     * [com.vscodroid.debug.DebugConsoleOverlay.log] so keyboard-show attempts
+     * (and their JS-side editable-check results) are visible on-device.
+     */
+    var onDebugLog: ((String) -> Unit)? = null
+
     // -- Long press state --
     private val longPressHandler = Handler(Looper.getMainLooper())
     private var longPressX = 0f
@@ -192,17 +199,21 @@ class VSCodroidWebViewComponent @JvmOverloads constructor(
      * the first attempt may run before that focus call has actually landed.
      */
     private fun checkAndShowKeyboard() {
+        onDebugLog?.invoke("Tap detected — scheduling editable-element check")
         postDelayed({ attemptShowKeyboard(retriesLeft = 1) }, KEYBOARD_CHECK_DELAY_MS)
     }
 
     private fun attemptShowKeyboard(retriesLeft: Int) {
         evaluateJavascript(ACTIVE_ELEMENT_IS_EDITABLE_JS) { result ->
+            onDebugLog?.invoke("activeElement editable check result: $result (retriesLeft=$retriesLeft)")
             if (result == "true") {
                 forceShowKeyboard()
             } else if (retriesLeft > 0) {
                 // Monaco's focus() may land a tick later than our first check —
                 // try once more before giving up.
                 postDelayed({ attemptShowKeyboard(retriesLeft - 1) }, KEYBOARD_RETRY_DELAY_MS)
+            } else {
+                onDebugLog?.invoke("Editable element NOT focused after tap — keyboard not forced")
             }
         }
     }
@@ -212,6 +223,7 @@ class VSCodroidWebViewComponent @JvmOverloads constructor(
         val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
         if (imm == null) {
             Logger.w(tag, "InputMethodManager unavailable")
+            onDebugLog?.invoke("forceShowKeyboard: InputMethodManager unavailable!")
             return
         }
         // Re-establish a fresh InputConnection binding for the currently
@@ -219,6 +231,7 @@ class VSCodroidWebViewComponent @JvmOverloads constructor(
         imm.restartInput(this)
         imm.showSoftInput(this, InputMethodManager.SHOW_FORCED)
         Logger.d(tag, "Forced soft keyboard show (restartInput + SHOW_FORCED)")
+        onDebugLog?.invoke("forceShowKeyboard: restartInput() + showSoftInput(SHOW_FORCED) called")
     }
 
     companion object {
