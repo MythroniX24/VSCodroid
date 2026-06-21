@@ -10,6 +10,57 @@ package com.vscodroid.webview
  */
 object DesktopModeJS {
 
+    /**
+     * Installs a global JS error handler and logs key environment facts.
+     *
+     * ── Why this exists ──────────────────────────────────────────────────────
+     * Every other script in this file wraps its body in `try { } catch(e) {}`
+     * — empty catch blocks, by design, so a failure in one piece of optional
+     * desktop-mode JS can never crash VS Code itself. The cost of that safety
+     * is total invisibility: if any of those scripts has been silently
+     * throwing every single time (e.g. because `window.require` doesn't exist
+     * in this VS Code build, or `AndroidBridge` isn't attached yet when the
+     * script runs), there is NO way to know from outside — fixes can look
+     * identical to "doing nothing" even when the underlying cause is
+     * completely different each time.
+     *
+     * This script must be injected FIRST (before the other DesktopModeJS
+     * scripts) so its global `window.onerror`/`unhandledrejection` handlers
+     * are in place to catch anything that goes wrong in the scripts injected
+     * right after it. Logs are picked up by
+     * [com.vscodroid.webview.VSCodroidWebChromeClient.onConsoleMessage] and
+     * surfaced in [com.vscodroid.debug.DebugConsoleOverlay] on-device.
+     */
+    val DIAGNOSTIC_BOOT_LOG = """
+(function() {
+    if (window.__vscodroidDiagnosticsInstalled) return;
+    window.__vscodroidDiagnosticsInstalled = true;
+
+    console.log('[VSCodroid] ── Diagnostic boot log ──');
+    console.log('[VSCodroid] window.require exists: ' + (typeof window.require));
+    console.log('[VSCodroid] AndroidBridge exists: ' + (typeof AndroidBridge));
+    console.log('[VSCodroid] AndroidExtensionBridge exists: ' + (typeof AndroidExtensionBridge));
+    console.log('[VSCodroid] document.readyState: ' + document.readyState);
+    console.log('[VSCodroid] location.href: ' + location.href);
+    console.log('[VSCodroid] userAgent: ' + navigator.userAgent);
+
+    window.addEventListener('error', function(e) {
+        try {
+            console.error('[VSCodroid] UNCAUGHT ERROR: ' + e.message +
+                ' at ' + (e.filename || '?') + ':' + (e.lineno || '?') +
+                (e.error && e.error.stack ? '\n' + e.error.stack : ''));
+        } catch(x) {}
+    });
+    window.addEventListener('unhandledrejection', function(e) {
+        try {
+            console.error('[VSCodroid] UNHANDLED PROMISE REJECTION: ' + e.reason);
+        } catch(x) {}
+    });
+
+    console.log('[VSCodroid] Diagnostic handlers installed.');
+})();
+""".trimIndent()
+
     // NOTE: An earlier version of this object included MATCH_MEDIA_OVERRIDE
     // (spoofing matchMedia(pointer:coarse)/(hover:none)) and DESKTOP_CSS
     // (forcing fixed-pixel sizes on VS Code's activity bar/tabs/status bar
@@ -100,13 +151,17 @@ object DesktopModeJS {
     try {
         if (window.__vscodroidOpenFolderIntercepted) return;
         window.__vscodroidOpenFolderIntercepted = true;
+        console.log('[VSCodroid] INTERCEPT_OPEN_FOLDER: installing...');
 
         function triggerNativeFolderPicker() {
             var token = (window.__vscodroid || {}).authToken;
+            console.log('[VSCodroid] triggerNativeFolderPicker called. authToken set: ' + !!token + ', AndroidBridge: ' + (typeof AndroidBridge));
             if (token && typeof AndroidBridge !== 'undefined') {
                 AndroidBridge.openFolderPicker(token);
+                console.log('[VSCodroid] AndroidBridge.openFolderPicker(token) invoked.');
                 return true;
             }
+            console.error('[VSCodroid] triggerNativeFolderPicker FAILED: token=' + token + ' AndroidBridge=' + (typeof AndroidBridge));
             return false;
         }
 
@@ -125,6 +180,7 @@ object DesktopModeJS {
                 if (awaitingChordKey && e.ctrlKey && !e.shiftKey && !e.altKey && key === 'o') {
                     awaitingChordKey = false;
                     clearTimeout(chordTimeout);
+                    console.log('[VSCodroid] Layer 1: Ctrl+K Ctrl+O chord detected');
                     if (triggerNativeFolderPicker()) {
                         e.preventDefault();
                         e.stopImmediatePropagation();
@@ -132,8 +188,9 @@ object DesktopModeJS {
                     return;
                 }
                 awaitingChordKey = false;
-            } catch(err) {}
+            } catch(err) { console.error('[VSCodroid] Layer 1 keydown handler error: ' + err); }
         }, true);
+        console.log('[VSCodroid] Layer 1 (Ctrl+K Ctrl+O) installed.');
 
         // Layer 2: click on any "Open Folder" link/button (command: href or text match)
         document.addEventListener('click', function(e) {
@@ -142,6 +199,7 @@ object DesktopModeJS {
                 for (var depth = 0; el && depth < 6; depth++, el = el.parentElement) {
                     var href = el.getAttribute && (el.getAttribute('href') || el.getAttribute('data-href'));
                     if (href && /command:.*openfolder/i.test(href)) {
+                        console.log('[VSCodroid] Layer 2: matched command-href "' + href + '"');
                         if (triggerNativeFolderPicker()) {
                             e.preventDefault();
                             e.stopImmediatePropagation();
@@ -150,6 +208,7 @@ object DesktopModeJS {
                     }
                     var text = (el.textContent || '').trim().toLowerCase();
                     if (text === 'open folder' || text === 'open folder...') {
+                        console.log('[VSCodroid] Layer 2: matched button text "' + text + '"');
                         if (triggerNativeFolderPicker()) {
                             e.preventDefault();
                             e.stopImmediatePropagation();
@@ -157,24 +216,33 @@ object DesktopModeJS {
                         return;
                     }
                 }
-            } catch(err) {}
+            } catch(err) { console.error('[VSCodroid] Layer 2 click handler error: ' + err); }
         }, true);
+        console.log('[VSCodroid] Layer 2 (click interception) installed.');
 
         // Layer 3: override the command registry entry (Command Palette path)
         var attempts = 0;
         var iv = setInterval(function() {
             attempts++;
-            if (attempts > 60) { clearInterval(iv); return; }
+            if (attempts > 60) {
+                clearInterval(iv);
+                console.error('[VSCodroid] Layer 3 FAILED after 60 attempts: window.require=' + (typeof window.require) + ' — CommandsRegistry never became available.');
+                return;
+            }
             try {
                 var cs = window.require && window.require('vs/platform/commands/common/commands');
                 if (!cs || !cs.CommandsRegistry) return;
                 clearInterval(iv);
                 cs.CommandsRegistry.registerCommand('workbench.action.files.openFolder', function() {
+                    console.log('[VSCodroid] Layer 3: workbench.action.files.openFolder override fired');
                     triggerNativeFolderPicker();
                 });
-            } catch(err) { /* retry */ }
+                console.log('[VSCodroid] Layer 3 (command registry override) installed after ' + attempts + ' attempts.');
+            } catch(err) {
+                console.error('[VSCodroid] Layer 3 attempt ' + attempts + ' threw: ' + err);
+            }
         }, 250);
-    } catch(e) {}
+    } catch(e) { console.error('[VSCodroid] INTERCEPT_OPEN_FOLDER fatal error: ' + e); }
 })();
 """.trimIndent()
 
