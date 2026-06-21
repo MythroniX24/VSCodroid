@@ -30,7 +30,15 @@ import com.vscodroid.util.Logger
  */
 class VSCodroidWebChromeClient(
     private val onFileChooserRequested: ((ValueCallback<Array<Uri>>) -> Unit)? = null,
-    private val onWindowCreateRequested: ((WebView) -> Unit)? = null
+    private val onWindowCreateRequested: ((WebView) -> Unit)? = null,
+    /**
+     * Forwards every captured console message (level + text) to a sink other
+     * than Logcat — wired to [com.vscodroid.debug.DebugConsoleOverlay.logFromWebView]
+     * by [MainActivity] so console output (including JS errors our own
+     * injected scripts' try/catch blocks would otherwise swallow silently) is
+     * visible directly on-device without needing chrome://inspect on a PC.
+     */
+    private val onConsoleMessageCaptured: ((level: String, message: String) -> Unit)? = null
 ) : WebChromeClient() {
 
     private val tag = "WebChromeClient"
@@ -40,7 +48,8 @@ class VSCodroidWebChromeClient(
     override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
         val message = "[JS:${consoleMessage.sourceId()}:${consoleMessage.lineNumber()}] " +
             consoleMessage.message()
-        when (consoleMessage.messageLevel()) {
+        val level = consoleMessage.messageLevel()
+        when (level) {
             ConsoleMessage.MessageLevel.ERROR   -> Logger.e(tag, message)
             ConsoleMessage.MessageLevel.WARNING -> Logger.w(tag, message)
             ConsoleMessage.MessageLevel.LOG     -> Logger.d(tag, message)
@@ -48,6 +57,7 @@ class VSCodroidWebChromeClient(
             ConsoleMessage.MessageLevel.TIP     -> Logger.d(tag, message)
             else                               -> Logger.d(tag, message)
         }
+        onConsoleMessageCaptured?.invoke(level.name, message)
         return true  // consumed — don't show default WebView console overlay
     }
 
