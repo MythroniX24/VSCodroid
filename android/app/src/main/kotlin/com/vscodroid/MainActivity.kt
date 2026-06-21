@@ -28,6 +28,7 @@ import com.vscodroid.bridge.AndroidBridge
 import com.vscodroid.bridge.ClipboardBridge
 import com.vscodroid.bridge.ExtensionBridge
 import com.vscodroid.bridge.SecurityManager
+import com.vscodroid.debug.DebugConsoleOverlay
 import com.vscodroid.keyboard.ExtraKeyRow
 import com.vscodroid.keyboard.KeyInjector
 import com.vscodroid.service.NodeService
@@ -53,6 +54,7 @@ class MainActivity : AppCompatActivity() {
     // -- Views --
     private var webView: VSCodroidWebViewComponent? = null
     private var extraKeyRow: ExtraKeyRow? = null
+    private var debugConsole: DebugConsoleOverlay? = null
 
     // -- Service --
     private var nodeService: NodeService? = null
@@ -91,7 +93,10 @@ class MainActivity : AppCompatActivity() {
      */
     private val folderPickerLauncher = registerForActivityResult(
         ActivityResultContracts.OpenDocumentTree()
-    ) { uri -> uri?.let { handleSafFolderSelected(it) } }
+    ) { uri ->
+        debugConsole?.log("folderPickerLauncher result: uri=$uri")
+        uri?.let { handleSafFolderSelected(it) }
+    }
 
     /**
      * Generic file picker for WebView [VSCodroidWebChromeClient.onShowFileChooser].
@@ -168,6 +173,7 @@ class MainActivity : AppCompatActivity() {
 
         setupWebView()
         setupExtraKeyRow()
+        setupDebugConsole()
         setupBackNavigation()
         requestNotificationPermission()
         startAndBindService()
@@ -250,6 +256,7 @@ class MainActivity : AppCompatActivity() {
      * back to its own default starting location (no crash risk).
      */
     fun openFolderPicker() {
+        debugConsole?.log("openFolderPicker() called — launching SAF picker at Internal Storage root")
         val internalStorageRoot = Uri.parse(
             "content://com.android.externalstorage.documents/document/primary%3A"
         )
@@ -262,6 +269,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun handleSafFolderSelected(uri: Uri) {
         Logger.i(tag, "SAF folder selected: $uri")
+        debugConsole?.log("handleSafFolderSelected: starting sync for $uri")
         safManager.persistPermission(uri)
         val displayName = safManager.getDisplayName(uri)
 
@@ -285,17 +293,20 @@ class MainActivity : AppCompatActivity() {
                 safManager.startFileWatcher(mirrorDir, uri)
                 writeActiveFolder(mirrorDir.absolutePath)
                 dialog.dismiss()
+                debugConsole?.log("handleSafFolderSelected: sync OK → ${mirrorDir.absolutePath}, navigating")
                 if (serverPort > 0) navigateToFolder(serverPort, mirrorDir.absolutePath)
             } catch (e: SecurityException) {
                 dialog.dismiss()
                 Toast.makeText(this@MainActivity,
                     "Permission denied. Please select the folder again.", Toast.LENGTH_LONG).show()
                 Logger.e(tag, "SAF permission revoked during sync", e)
+                debugConsole?.log("handleSafFolderSelected: SecurityException — ${e.message}")
             } catch (e: Exception) {
                 dialog.dismiss()
                 Toast.makeText(this@MainActivity,
                     "Failed to open folder: ${e.message}", Toast.LENGTH_LONG).show()
                 Logger.e(tag, "SAF sync failed", e)
+                debugConsole?.log("handleSafFolderSelected: Exception — ${e.javaClass.simpleName}: ${e.message}")
             }
         }
     }
@@ -462,6 +473,21 @@ class MainActivity : AppCompatActivity() {
         extraKeyRow?.setupWithRootView(findViewById(R.id.webViewContainer))
     }
 
+    /**
+     * Sets up the temporary on-device debug console (see [DebugConsoleOverlay]).
+     * Only visible in debuggable builds — the same gate used for Chrome remote
+     * debugging elsewhere ([VSCodroidWebView.configure]) — so it never appears
+     * in a hypothetical release build.
+     */
+    private fun setupDebugConsole() {
+        if (!Logger.debugEnabled) return
+        debugConsole = findViewById(R.id.debugConsole)
+        debugConsole?.log("VSCodroid debug console started.")
+        // Wire here (not in setupWebView) since debugConsole doesn't exist yet
+        // at that point in onCreate's call order.
+        webView?.onDebugLog = { msg -> debugConsole?.log(msg) }
+    }
+
     private fun setupBackNavigation() {
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
@@ -621,6 +647,13 @@ class MainActivity : AppCompatActivity() {
                 // separately — VS Code's internal iframe routing handles the display.
                 VSCodroidWebView.configure(newWebView)
                 Logger.d(tag, "Extension webview window created")
+            },
+            // Forward every JS console message to the on-device debug console
+            // overlay too, not just Logcat — see DebugConsoleOverlay's kdoc for
+            // why this is the key piece for diagnosing "fix didn't change
+            // anything" reports without PC/chrome://inspect access.
+            onConsoleMessageCaptured = { level, message ->
+                debugConsole?.logFromWebView(level, message)
             }
         )
 
@@ -657,6 +690,13 @@ class MainActivity : AppCompatActivity() {
     private fun injectBridgeToken() {
         val wv = webView ?: return
         val token = securityManager.getSessionToken()
+        debugConsole?.log("injectBridgeToken() running — page finished loading.")
+
+        // 0. Diagnostics FIRST — installs global error handlers so any JS
+        //    exception thrown by the scripts injected right after this one is
+        //    actually visible (instead of being silently swallowed by their
+        //    own try/catch blocks) and logs key environment facts.
+        wv.evaluateJavascript(DesktopModeJS.DIAGNOSTIC_BOOT_LOG, null)
 
         // 1. Expose auth token — must be first so all other injections can use it
         wv.evaluateJavascript(
@@ -723,6 +763,7 @@ class MainActivity : AppCompatActivity() {
         )
         webView = newWebView
         bridgeInitialized = false
+        webView?.onDebugLog = { msg -> debugConsole?.log(msg) }
 
         setupWebView()
         if (serverPort > 0) {
