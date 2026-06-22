@@ -199,21 +199,27 @@ class VSCodroidWebViewComponent @JvmOverloads constructor(
      * the first attempt may run before that focus call has actually landed.
      */
     private fun checkAndShowKeyboard() {
-        onDebugLog?.invoke("Tap detected — scheduling editable-element check")
-        postDelayed({ attemptShowKeyboard(retriesLeft = 1) }, KEYBOARD_CHECK_DELAY_MS)
+        onDebugLog?.invoke("Tap detected — scheduling keyboard check")
+        postDelayed({ attemptShowKeyboard(retriesLeft = 2) }, KEYBOARD_CHECK_DELAY_MS)
     }
 
     private fun attemptShowKeyboard(retriesLeft: Int) {
-        evaluateJavascript(ACTIVE_ELEMENT_IS_EDITABLE_JS) { result ->
-            onDebugLog?.invoke("activeElement editable check result: $result (retriesLeft=$retriesLeft)")
-            if (result == "true") {
-                forceShowKeyboard()
-            } else if (retriesLeft > 0) {
-                // Monaco's focus() may land a tick later than our first check —
-                // try once more before giving up.
-                postDelayed({ attemptShowKeyboard(retriesLeft - 1) }, KEYBOARD_RETRY_DELAY_MS)
-            } else {
-                onDebugLog?.invoke("Editable element NOT focused after tap — keyboard not forced")
+        evaluateJavascript(FOCUS_MONACO_AND_CHECK_JS) { result ->
+            val clean = result?.trim('"') ?: "none"
+            onDebugLog?.invoke("Keyboard check result: '$clean' (retriesLeft=$retriesLeft)")
+            when {
+                clean == "none" && retriesLeft > 0 -> {
+                    postDelayed({ attemptShowKeyboard(retriesLeft - 1) }, KEYBOARD_RETRY_DELAY_MS)
+                }
+                clean == "none" -> {
+                    onDebugLog?.invoke("No editable element — keyboard not forced")
+                }
+                else -> {
+                    // JS already called .focus() on Monaco textarea (if found),
+                    // which triggers Chromium's own IME activation. We still call
+                    // native showSoftInput as a belt-and-suspenders backup.
+                    forceShowKeyboard()
+                }
             }
         }
     }
@@ -222,16 +228,12 @@ class VSCodroidWebViewComponent @JvmOverloads constructor(
         requestFocus()
         val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
         if (imm == null) {
-            Logger.w(tag, "InputMethodManager unavailable")
             onDebugLog?.invoke("forceShowKeyboard: InputMethodManager unavailable!")
             return
         }
-        // Re-establish a fresh InputConnection binding for the currently
-        // focused DOM element before asking the system to display the IME.
         imm.restartInput(this)
         imm.showSoftInput(this, InputMethodManager.SHOW_FORCED)
-        Logger.d(tag, "Forced soft keyboard show (restartInput + SHOW_FORCED)")
-        onDebugLog?.invoke("forceShowKeyboard: restartInput() + showSoftInput(SHOW_FORCED) called")
+        onDebugLog?.invoke("forceShowKeyboard: restartInput + SHOW_FORCED called")
     }
 
     companion object {
@@ -251,16 +253,56 @@ class VSCodroidWebViewComponent @JvmOverloads constructor(
         /** Delay (ms) before the second (retry) activeElement check. */
         private const val KEYBOARD_RETRY_DELAY_MS = 200L
 
-        /** Returns "true"/"false" (as a JS boolean) depending on whether the currently focused element accepts text input. */
-        private const val ACTIVE_ELEMENT_IS_EDITABLE_JS = """
+        /**
+         * Returns the focused-element type string AND directly calls .focus() on Monaco's
+         * textarea if it exists — which triggers Chromium's own IME show mechanism
+         * (more reliable than the native showSoftInput path for embedded WebView + Monaco).
+         *
+         * Return values:
+         *  "monaco"  — Monaco editor textarea found and focused via JS
+         *  "direct"  — A normal textarea/input/contenteditable is already active
+         *  "none"    — No editable context found; don't show keyboard
+         */
+        private const val FOCUS_MONACO_AND_CHECK_JS = """
 (function(){
-    var el = document.activeElement;
-    if (!el) return false;
-    var tag = el.tagName ? el.tagName.toLowerCase() : '';
-    if (tag === 'textarea' || tag === 'input') return true;
-    if (el.isContentEditable) return true;
-    return false;
-})();
+    try {
+        // 1. Monaco editor's hidden-but-real input textarea
+        //    This is the authoritative way to tell Chromium to show the keyboard
+        //    for Monaco: focus the actual .inputarea element. Chromium responds to
+        //    JS .focus() on real input elements by showing the IME natively.
+        var monacoTA = document.querySelector('.monaco-editor textarea.inputarea') ||
+                       document.querySelector('textarea.inputarea');
+        if (monacoTA) {
+            monacoTA.focus();
+            return 'monaco';
+        }
+
+        // 2. Some other normal editable element already has focus
+        var el = document.activeElement;
+        if (!el) return 'none';
+        var tag = (el.tagName || '').toLowerCase();
+        if (tag === 'textarea' || tag === 'input' || el.isContentEditable) {
+            return 'direct';
+        }
+
+        // 3. If an iframe is focused, try to reach into it
+        if (tag === 'iframe') {
+            try {
+                var inner = el.contentDocument && el.contentDocument.activeElement;
+                if (inner) {
+                    var itag = (inner.tagName || '').toLowerCase();
+                    if (itag === 'textarea' || itag === 'input' || inner.isContentEditable) {
+                        inner.focus();
+                        return 'iframe-direct';
+                    }
+                    var innerMonaco = el.contentDocument.querySelector('textarea.inputarea');
+                    if (innerMonaco) { innerMonaco.focus(); return 'iframe-monaco'; }
+                }
+            } catch(x) {}
+        }
+        return 'none';
+    } catch(e) { return 'error:' + e.message; }
+})()
 """
     }
 }
