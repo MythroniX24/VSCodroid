@@ -257,34 +257,58 @@ class FirstRunSetup(private val context: Context) {
     }
 
     /**
-     * Creates a symlink so VS Code's @vscode/ripgrep finds rg at its expected path.
-     * The rg binary lives in nativeLibraryDir as libripgrep.so, but VS Code looks for
-     * node_modules/@vscode/ripgrep/bin/rg inside the server directory.
-     * Safe to call on every launch (recreates if stale, skips if current).
+     * Makes VS Code's @vscode/ripgrep find a working `rg` binary at its expected path.
+     *
+     * ── Why symlinking to nativeLibraryDir no longer works ───────────────────
+     * The original approach created a symlink:
+     *   .../server/vscode-reh/node_modules/@vscode/ripgrep/bin/rg
+     *     → nativeLibraryDir/libripgrep.so
+     *
+     * nativeLibraryDir (e.g. /data/app/<package>/lib/arm64/) is used by the
+     * Android runtime to load JNI .so files via System.loadLibrary(). Android
+     * mounts this location in a way that allows *loading* (dlopen) but NOT
+     * *executing* (exec/spawn) on Android 10+ for security reasons — only the
+     * ART runtime itself can spawn processes from that location. ProcessBuilder
+     * (Java) gets a special exemption; Node.js's child_process.spawn() does NOT.
+     *
+     * This is why VS Code's search feature logged:
+     *   spawn .../libripgrep.so EACCES
+     * even though the file existed and was readable.
+     *
+     * ── Fix ──────────────────────────────────────────────────────────────────
+     * COPY libripgrep.so to filesDir (writable, executable by our process),
+     * set executable bits, and point the expected `rg` path at the copy.
+     * filesDir is on the regular app-data partition, not a restricted mount,
+     * so Node.js's child_process.spawn() can execute files from it freely.
      */
     fun setupRipgrepVscodeSymlink() {
         val nativeLibDir = context.applicationInfo.nativeLibraryDir
-        val rgBinary = File("$nativeLibDir/libripgrep.so")
-        if (!rgBinary.exists()) return
+        val rgSource = File("$nativeLibDir/libripgrep.so")
+        if (!rgSource.exists()) {
+            Logger.d(tag, "libripgrep.so not found at $nativeLibDir — skipping ripgrep setup")
+            return
+        }
 
         val rgBinDir = File(context.filesDir, "server/vscode-reh/node_modules/@vscode/ripgrep/bin")
         rgBinDir.mkdirs()
-        val rgLink = File(rgBinDir, "rg")
-        val target = rgBinary.absolutePath
+        val rgDest = File(rgBinDir, "rg")
 
-        val linkExists = try { Os.lstat(rgLink.absolutePath); true } catch (e: Exception) { false }
-        if (linkExists) {
-            try {
-                if (Os.readlink(rgLink.absolutePath) == target) return
-            } catch (_: Exception) { }
-            rgLink.delete()
+        // Re-copy if: file missing, size differs (binary was updated), or not executable
+        if (rgDest.exists() && rgDest.length() == rgSource.length() && rgDest.canExecute()) {
+            Logger.d(tag, "ripgrep already installed at ${rgDest.absolutePath}")
+            return
         }
 
         try {
-            Os.symlink(target, rgLink.absolutePath)
-            Logger.i(tag, "ripgrep symlink: ${rgLink.absolutePath} -> $target")
+            rgSource.copyTo(rgDest, overwrite = true)
+            // setExecutable(true, false) = executable by ALL users, not just owner.
+            // Node.js spawns the binary as the app's own UID but with a clean env
+            // that may use a different effective UID in some configurations.
+            rgDest.setExecutable(true, false)
+            rgDest.setReadable(true, false)
+            Logger.i(tag, "ripgrep installed: ${rgDest.absolutePath} (${rgDest.length()} bytes, executable=${rgDest.canExecute()})")
         } catch (e: Exception) {
-            Logger.d(tag, "Failed to create ripgrep symlink: ${e.message}")
+            Logger.e(tag, "Failed to install ripgrep binary: ${e.message}")
         }
     }
 
