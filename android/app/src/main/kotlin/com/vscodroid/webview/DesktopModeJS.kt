@@ -221,16 +221,21 @@ object DesktopModeJS {
         console.log('[VSCodroid] Layer 2 (click interception) installed.');
 
         // Layer 3: override the command registry entry (Command Palette path)
+        // window.require is undefined in VS Code 1.96 (ESM build) — try globalThis.require
+        var _req = window.require || globalThis.require || self.require || null;
         var attempts = 0;
         var iv = setInterval(function() {
             attempts++;
+            // Also re-check on each attempt — VS Code's AMD loader may attach later
+            _req = window.require || globalThis.require || self.require || null;
             if (attempts > 60) {
                 clearInterval(iv);
-                console.error('[VSCodroid] Layer 3 FAILED after 60 attempts: window.require=' + (typeof window.require) + ' — CommandsRegistry never became available.');
+                console.error('[VSCodroid] Layer 3 FAILED after 60 attempts: window.require=' + (typeof window.require) + ' globalThis.require=' + (typeof globalThis.require) + ' — CommandsRegistry never became available.');
                 return;
             }
             try {
-                var cs = window.require && window.require('vs/platform/commands/common/commands');
+                if (!_req) return;
+                var cs = _req('vs/platform/commands/common/commands');
                 if (!cs || !cs.CommandsRegistry) return;
                 clearInterval(iv);
                 cs.CommandsRegistry.registerCommand('workbench.action.files.openFolder', function() {
@@ -239,7 +244,7 @@ object DesktopModeJS {
                 });
                 console.log('[VSCodroid] Layer 3 (command registry override) installed after ' + attempts + ' attempts.');
             } catch(err) {
-                console.error('[VSCodroid] Layer 3 attempt ' + attempts + ' threw: ' + err);
+                if (attempts === 1) console.error('[VSCodroid] Layer 3 attempt ' + attempts + ' threw: ' + err);
             }
         }, 250);
     } catch(e) { console.error('[VSCodroid] INTERCEPT_OPEN_FOLDER fatal error: ' + e); }
@@ -350,11 +355,18 @@ object DesktopModeJS {
         var attempts = 0;
         var iv = setInterval(function() {
             attempts++;
-            if (attempts > 60) { clearInterval(iv); return; }
+            if (attempts > 60) {
+                clearInterval(iv);
+                console.warn('[VSCodroid] PALETTE_COMMANDS: require never found after 60 attempts.');
+                return;
+            }
             try {
-                var cs = window.require && window.require('vs/platform/commands/common/commands');
+                var _req = window.require || globalThis.require || self.require || null;
+                if (!_req) return;
+                var cs = _req('vs/platform/commands/common/commands');
                 if (!cs || !cs.CommandsRegistry) return;
                 clearInterval(iv);
+                console.log('[VSCodroid] PALETTE_COMMANDS: CommandsRegistry found after ' + attempts + ' attempts.');
 
                 function token()  { return (window.__vscodroid||{}).authToken; }
                 function bridge() { return typeof AndroidBridge!=='undefined'?AndroidBridge:null; }
@@ -362,7 +374,7 @@ object DesktopModeJS {
                 function reg(id, title, fn) {
                     try { cs.CommandsRegistry.registerCommand(id, fn); } catch(e) {}
                     try {
-                        var ar = window.require('vs/platform/actions/common/actions');
+                        var ar = _req('vs/platform/actions/common/actions');
                         ar.MenuRegistry.appendMenuItem(ar.MenuId.CommandPalette,
                             {command:{id:id,title:title}});
                     } catch(e) {}
